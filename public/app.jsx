@@ -1,10 +1,11 @@
 import { useCallEngine } from './call-engine.js';
 import { CallPane } from './call-pane.jsx';
 const { useEffect, useMemo, useState } = React;
+const DEFAULT_API_BASE = 'https://doctor-patient-ai-app.onrender.com';
 function App() {
   const isNativeApp = Boolean(window.Capacitor && (window.Capacitor.isNativePlatform?.() ?? true));
   const [token, setToken] = useState(localStorage.getItem('token') || '');
-  const [apiBase, setApiBase] = useState(localStorage.getItem('API_BASE_URL') || '');
+  const apiBase = DEFAULT_API_BASE;
   const [me, setMe] = useState(null);
   const [consultations, setConsultations] = useState([]);
   const [selected, setSelected] = useState(null);
@@ -50,9 +51,7 @@ function App() {
     }
     const base = apiBase.trim().replace(/\/$/, '');
     const absolute = /^https?:\/\//i.test(path);
-    if (!absolute && isNativeApp && !base) {
-      throw new Error('Set API Base URL in Session card (example: http://192.168.1.10:4000)');
-    }
+    if (!absolute && !base) throw new Error('API Base URL is not configured');
     const finalUrl = absolute ? path : base ? `${base}${path}` : path;
     const capacitorHttp = window.Capacitor?.Plugins?.CapacitorHttp;
     const isForm = options.body instanceof FormData;
@@ -152,11 +151,10 @@ function App() {
     bootstrap();
   }, [token]);
   useEffect(() => {
-    if (!apiBase.trim()) return;
     call.loadRtcConfig().catch(() => {
       // Keep defaults when API is not reachable yet.
     });
-  }, [apiBase]);
+  }, []);
   useEffect(() => {
     if (!me) return;
     if (me.role === 'PATIENT') refreshDoctors().catch((e) => notify(e.message, true));
@@ -218,28 +216,6 @@ function App() {
     setPrescriptions([]);
     setBooking({ doctorId: '', scheduledAt: '' });
   }
-  function saveApiBase() {
-    let clean = apiBase.trim().replace(/\/$/, '');
-    if (clean && !/^https?:\/\//i.test(clean)) {
-      clean = `http://${clean}`;
-    }
-    localStorage.setItem('API_BASE_URL', clean);
-    setApiBase(clean);
-    call
-      .loadRtcConfig()
-      .then(() => notify('API Base URL saved'))
-      .catch(() => notify('API Base URL saved (RTC defaults loaded)'));
-  }
-  async function testConnection() {
-    try {
-      const body = await api('/health');
-      if (!body?.ok) throw new Error('Health check response invalid');
-      await call.loadRtcConfig();
-      notify('Connection test passed');
-    } catch (err) {
-      notify(`Connection test failed: ${err.message}`, true);
-    }
-  }
   async function openConsultation(id) {
     const existing = consultations.find((c) => c._id === id);
     if (isPatient && existing && existing.status !== 'IN_PROGRESS') {
@@ -255,7 +231,7 @@ function App() {
     } catch (err) {
       const msg = String(err?.message || '');
       if (msg.includes('Failed to fetch')) {
-        notify(`Network fetch failed. Current API URL: ${apiBase || '(empty)'}. Use http://<laptop-ip>:4000 on same Wi-Fi.`, true);
+        notify(`Network fetch failed. API URL: ${apiBase}`, true);
       } else {
         notify(msg, true);
       }
@@ -299,7 +275,7 @@ function App() {
     } catch (err) {
       const msg = String(err?.message || '');
       if (msg.includes('Failed to fetch')) {
-        notify(`Network fetch failed. Current API URL: ${apiBase || '(empty)'}. Use http://<laptop-ip>:4000 on same Wi-Fi.`, true);
+        notify(`Network fetch failed. API URL: ${apiBase}`, true);
       } else {
         notify(msg, true);
       }
@@ -393,20 +369,6 @@ function App() {
         <section className="stack left">
           {!isLoggedIn && (
             <>
-              <article className="card">
-                <div className="card-head">
-                  <h2>Server</h2>
-                  <p>Set backend URL before login.</p>
-                </div>
-                <label>
-                  API Base URL
-                  <input placeholder="http://192.168.1.10:4000" value={apiBase} onChange={(e) => setApiBase(e.target.value)} />
-                </label>
-                <div className="row">
-                  <button className="btn tiny" onClick={saveApiBase}>Save API URL</button>
-                  <button className="btn tiny" onClick={testConnection}>Test Connection</button>
-                </div>
-              </article>
               <article className="card">
                 <div className="card-head">
                   <h2>Authentication</h2>
