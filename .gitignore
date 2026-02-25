@@ -13,5 +13,9 @@ public/app.bundle.js
 # Runtime files
 uploads/
 
+# Android signing secrets
+android/app/*.jks
+android/app/keystore.properties
+
 # OS
 .DS_Store
