@@ -5,8 +5,8 @@
   "main": "dist/server.js",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
-    "build:web": "npx esbuild public/app.jsx --bundle --outfile=public/app.bundle.js --loader:.jsx=jsx --jsx-factory=React.createElement --jsx-fragment=React.Fragment --target=es2019",
-    "build": "npm run build:web && tsc -p tsconfig.json",
+    "build:web": "bash public/build-app.sh",
+    "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js"
   },
   "keywords": [
