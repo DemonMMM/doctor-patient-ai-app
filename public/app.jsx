@@ -20,6 +20,7 @@ function App() {
   const [booking, setBooking] = useState({ doctorId: '', scheduledAt: '' });
   const [creating, setCreating] = useState(false);
   const [chatMessage, setChatMessage] = useState('');
+  const [page, setPage] = useState('home');
   const [toast, setToast] = useState({ show: false, message: '', bad: false });
   const [modal, setModal] = useState({ show: false, title: '', message: '' });
   const isLoggedIn = Boolean(token && me);
@@ -171,6 +172,7 @@ function App() {
       }
       localStorage.setItem('token', nextToken);
       setToken(nextToken);
+      setPage('consultations');
       setLogin({ email: '', password: '' });
       notify('Login successful');
     } catch (err) {
@@ -196,6 +198,7 @@ function App() {
       }
       localStorage.setItem('token', nextToken);
       setToken(nextToken);
+      setPage('consultations');
       setRegister({ name: '', email: '', password: '', role: 'PATIENT', specialization: '' });
       notify('Registration successful');
     } catch (err) {
@@ -215,6 +218,7 @@ function App() {
     setAdminDoctors([]);
     setPrescriptions([]);
     setBooking({ doctorId: '', scheduledAt: '' });
+    setPage('home');
   }
   async function openConsultation(id) {
     const existing = consultations.find((c) => c._id === id);
@@ -227,6 +231,7 @@ function App() {
       const r = await api(`/api/consultations/${id}`);
       setSelected(r.data);
       call.setCallStatus('Call not started.');
+      setPage('detail');
       notify('Consultation loaded');
     } catch (err) {
       const msg = String(err?.message || '');
@@ -365,6 +370,14 @@ function App() {
           <span className={`pill ${isLoggedIn ? 'good' : 'neutral'}`}>{apiStatus}</span>
         </div>
       </header>
+      {isLoggedIn && (
+        <div className="segmented app-nav">
+          <button className={page === 'home' ? 'active' : ''} onClick={() => setPage('home')}>Home</button>
+          <button className={page === 'consultations' ? 'active' : ''} onClick={() => setPage('consultations')}>Consultations</button>
+          <button className={page === 'detail' ? 'active' : ''} onClick={() => setPage('detail')} disabled={!selected}>Detail</button>
+          {!isAdmin ? <button className={page === 'prescriptions' ? 'active' : ''} onClick={() => setPage('prescriptions')}>Prescriptions</button> : null}
+        </div>
+      )}
       <main className="layout">
         <section className="stack left">
           {!isLoggedIn && (
@@ -405,7 +418,7 @@ function App() {
               </article>
             </>
           )}
-          {isLoggedIn && (
+          {isLoggedIn && page === 'home' && (
             <article className="card">
               <div className="card-head">
                 <h2>Session</h2>
@@ -418,7 +431,7 @@ function App() {
               <button className="btn ghost" onClick={logout}>Logout</button>
             </article>
           )}
-          {isPatient && (
+          {isPatient && page === 'home' && (
             <article className="card">
               <div className="card-head">
                 <h2>Book Consultation</h2>
@@ -440,7 +453,7 @@ function App() {
               </form>
             </article>
           )}
-          {isAdmin && (
+          {isAdmin && page === 'home' && (
             <article className="card">
               <div className="card-head">
                 <h2>Admin Control</h2>
@@ -474,6 +487,7 @@ function App() {
           )}
         </section>
         <section className="stack right">
+          {isLoggedIn && page === 'consultations' && (
           <article className="card">
             <div className="list-head">
               <div><h2>Consultations</h2><p>Pick one to open details.</p></div>
@@ -495,7 +509,15 @@ function App() {
               })}
             </div>
           </article>
-          {selected && (
+          )}
+          {isLoggedIn && page === 'detail' && !selected && (
+            <article className="card">
+              <div className="item">
+                <div className="meta">Select a consultation first from the Consultations page.</div>
+              </div>
+            </article>
+          )}
+          {isLoggedIn && page === 'detail' && selected && (
             <article className="card">
               <div className="list-head">
                 <div>
@@ -573,7 +595,7 @@ function App() {
               </div>
             </article>
           )}
-          {isLoggedIn && !isAdmin && (
+          {isLoggedIn && !isAdmin && page === 'prescriptions' && (
             <article className="card">
               <div className="list-head">
                 <div><h2>Prescriptions</h2><p>Issued or received prescriptions.</p></div>

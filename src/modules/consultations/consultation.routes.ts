@@ -1,29 +1,14 @@
-import { Router, type Request } from 'express';
+import { Router } from 'express';
 import multer from 'multer';
 import { requireAuth } from '../../middlewares/auth.middleware';
 import { requireRole } from '../../middlewares/role.middleware';
-import { env } from '../../config/env';
 import { ConsultationController } from './consultation.controller';
 import { AIController } from '../ai/ai.controller';
 
 export const consultationRouter = Router();
 
-type DestCallback = (error: Error | null, destination: string) => void;
-type FilenameCallback = (error: Error | null, filename: string) => void;
-type UploadLikeFile = { originalname: string };
-
-const storage = multer.diskStorage({
-  destination: (req: Request, file: UploadLikeFile, cb: DestCallback) => {
-    cb(null, env.uploadDir);
-  },
-  filename: (req: Request, file: UploadLikeFile, cb: FilenameCallback) => {
-    const safeOriginal = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
-    cb(null, `${Date.now()}_${safeOriginal}`);
-  }
-});
-
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 }
 });
 
@@ -33,6 +18,7 @@ consultationRouter.get('/my/prescriptions', requireAuth, requireRole('PATIENT', 
 
 consultationRouter.get('/:id', requireAuth, requireRole('PATIENT', 'DOCTOR', 'ADMIN'), ConsultationController.getById);
 consultationRouter.post('/:id/messages', requireAuth, requireRole('PATIENT', 'DOCTOR', 'ADMIN'), ConsultationController.addMessage);
+consultationRouter.get('/:id/reports/:fileId/view', requireAuth, requireRole('PATIENT', 'DOCTOR', 'ADMIN'), ConsultationController.viewReport);
 consultationRouter.get('/:id/call/signals', requireAuth, requireRole('PATIENT', 'DOCTOR'), ConsultationController.getCallSignals);
 consultationRouter.post('/:id/call/signal', requireAuth, requireRole('PATIENT', 'DOCTOR'), ConsultationController.sendCallSignal);
 

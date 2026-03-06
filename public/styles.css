@@ -196,6 +196,11 @@ h4 {
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.07);
 }
 
+.app-nav {
+  max-width: 720px;
+  margin: 0 0 14px;
+}
+
 .form,
 .inline-form {
   display: flex;

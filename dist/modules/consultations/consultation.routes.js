@@ -8,21 +8,11 @@ const express_1 = require("express");
 const multer_1 = __importDefault(require("multer"));
 const auth_middleware_1 = require("../../middlewares/auth.middleware");
 const role_middleware_1 = require("../../middlewares/role.middleware");
-const env_1 = require("../../config/env");
 const consultation_controller_1 = require("./consultation.controller");
 const ai_controller_1 = require("../ai/ai.controller");
 exports.consultationRouter = (0, express_1.Router)();
-const storage = multer_1.default.diskStorage({
-    destination: (req, file, cb) => {
-        cb(null, env_1.env.uploadDir);
-    },
-    filename: (req, file, cb) => {
-        const safeOriginal = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
-        cb(null, `${Date.now()}_${safeOriginal}`);
-    }
-});
 const upload = (0, multer_1.default)({
-    storage,
+    storage: multer_1.default.memoryStorage(),
     limits: { fileSize: 10 * 1024 * 1024 }
 });
 exports.consultationRouter.post('/', auth_middleware_1.requireAuth, (0, role_middleware_1.requireRole)('PATIENT'), consultation_controller_1.ConsultationController.create);
@@ -30,6 +20,7 @@ exports.consultationRouter.get('/my', auth_middleware_1.requireAuth, (0, role_mi
 exports.consultationRouter.get('/my/prescriptions', auth_middleware_1.requireAuth, (0, role_middleware_1.requireRole)('PATIENT', 'DOCTOR'), consultation_controller_1.ConsultationController.myPrescriptions);
 exports.consultationRouter.get('/:id', auth_middleware_1.requireAuth, (0, role_middleware_1.requireRole)('PATIENT', 'DOCTOR', 'ADMIN'), consultation_controller_1.ConsultationController.getById);
 exports.consultationRouter.post('/:id/messages', auth_middleware_1.requireAuth, (0, role_middleware_1.requireRole)('PATIENT', 'DOCTOR', 'ADMIN'), consultation_controller_1.ConsultationController.addMessage);
+exports.consultationRouter.get('/:id/reports/:fileId/view', auth_middleware_1.requireAuth, (0, role_middleware_1.requireRole)('PATIENT', 'DOCTOR', 'ADMIN'), consultation_controller_1.ConsultationController.viewReport);
 exports.consultationRouter.get('/:id/call/signals', auth_middleware_1.requireAuth, (0, role_middleware_1.requireRole)('PATIENT', 'DOCTOR'), consultation_controller_1.ConsultationController.getCallSignals);
 exports.consultationRouter.post('/:id/call/signal', auth_middleware_1.requireAuth, (0, role_middleware_1.requireRole)('PATIENT', 'DOCTOR'), consultation_controller_1.ConsultationController.sendCallSignal);
 // Upload report

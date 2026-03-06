@@ -7,6 +7,7 @@ import { Prescription } from '../prescriptions/prescription.model';
 import { fail, created, ok } from '../../utils/response';
 import { env } from '../../config/env';
 import { PrescriptionService } from '../prescriptions/prescription.service';
+import { ReportStorage } from '../files/report.storage';
 
 function isObjectId(id: string): boolean {
   return Types.ObjectId.isValid(id);
@@ -26,7 +27,7 @@ type UploadedReportFile = {
   originalname: string;
   mimetype: string;
   size: number;
-  path: string;
+  buffer: Buffer;
 };
 
 type CallSignalType = 'offer' | 'answer' | 'ice-candidate' | 'hangup';
@@ -188,16 +189,53 @@ export class ConsultationController {
     const file = (req as any).file as UploadedReportFile | undefined;
     if (!file) return fail(res, 400, { message: 'file is required (multipart/form-data)' });
 
+    const stored = await ReportStorage.saveReport({
+      buffer: file.buffer,
+      filename: file.originalname,
+      contentType: file.mimetype,
+      consultationId: c.id,
+      uploadedByUserId: req.user.id
+    });
+
     c.reports.push({
       originalName: file.originalname,
       mimeType: file.mimetype,
       size: file.size,
-      path: file.path.replace(/\\/g, '/'),
+      path: `/api/consultations/${c.id}/reports/${stored._id.toString()}/view`,
       uploadedAt: new Date()
     });
 
     await c.save();
     return ok(res, c, 'Report uploaded');
+  }
+
+  static async viewReport(req: Request, res: Response) {
+    if (!req.user) return fail(res, 401, { message: 'Unauthorized' });
+
+    const c = await Consultation.findById(req.params.id);
+    if (!c) return fail(res, 404, { message: 'Consultation not found' });
+    if (!canAccessConsultation(req.user, c)) return fail(res, 403, { message: 'Forbidden' });
+
+    const fileId = req.params.fileId;
+    if (!Types.ObjectId.isValid(fileId)) return fail(res, 400, { message: 'Invalid fileId' });
+
+    const expectedPath = `/api/consultations/${c.id}/reports/${fileId}/view`;
+    const existsOnConsultation = (c.reports || []).some((r) => r.path === expectedPath);
+    if (!existsOnConsultation) return fail(res, 404, { message: 'Report not linked to consultation' });
+
+    const file = await ReportStorage.getReportFile(fileId);
+    if (!file) return fail(res, 404, { message: 'Report file not found' });
+
+    const mimeType = (file.metadata as { mimeType?: string } | undefined)?.mimeType;
+    res.setHeader('Content-Type', mimeType || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `inline; filename=\"${file.filename}\"`);
+
+    const stream = ReportStorage.openDownloadStream(fileId);
+    stream.on('error', () => {
+      if (!res.headersSent) return fail(res, 500, { message: 'Failed to read report file' });
+      res.end();
+    });
+    stream.pipe(res);
   }
 
   // Mock Razorpay: create order

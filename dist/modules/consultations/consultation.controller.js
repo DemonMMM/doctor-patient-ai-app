@@ -12,6 +12,7 @@ const prescription_model_1 = require("../prescriptions/prescription.model");
 const response_1 = require("../../utils/response");
 const env_1 = require("../../config/env");
 const prescription_service_1 = require("../prescriptions/prescription.service");
+const report_storage_1 = require("../files/report.storage");
 function isObjectId(id) {
     return mongoose_1.Types.ObjectId.isValid(id);
 }
@@ -158,15 +159,51 @@ class ConsultationController {
         const file = req.file;
         if (!file)
             return (0, response_1.fail)(res, 400, { message: 'file is required (multipart/form-data)' });
+        const stored = await report_storage_1.ReportStorage.saveReport({
+            buffer: file.buffer,
+            filename: file.originalname,
+            contentType: file.mimetype,
+            consultationId: c.id,
+            uploadedByUserId: req.user.id
+        });
         c.reports.push({
             originalName: file.originalname,
             mimeType: file.mimetype,
             size: file.size,
-            path: file.path.replace(/\\/g, '/'),
+            path: `/api/consultations/${c.id}/reports/${stored._id.toString()}/view`,
             uploadedAt: new Date()
         });
         await c.save();
         return (0, response_1.ok)(res, c, 'Report uploaded');
+    }
+    static async viewReport(req, res) {
+        if (!req.user)
+            return (0, response_1.fail)(res, 401, { message: 'Unauthorized' });
+        const c = await consultation_model_1.Consultation.findById(req.params.id);
+        if (!c)
+            return (0, response_1.fail)(res, 404, { message: 'Consultation not found' });
+        if (!canAccessConsultation(req.user, c))
+            return (0, response_1.fail)(res, 403, { message: 'Forbidden' });
+        const fileId = req.params.fileId;
+        if (!mongoose_1.Types.ObjectId.isValid(fileId))
+            return (0, response_1.fail)(res, 400, { message: 'Invalid fileId' });
+        const expectedPath = `/api/consultations/${c.id}/reports/${fileId}/view`;
+        const existsOnConsultation = (c.reports || []).some((r) => r.path === expectedPath);
+        if (!existsOnConsultation)
+            return (0, response_1.fail)(res, 404, { message: 'Report not linked to consultation' });
+        const file = await report_storage_1.ReportStorage.getReportFile(fileId);
+        if (!file)
+            return (0, response_1.fail)(res, 404, { message: 'Report file not found' });
+        const mimeType = file.metadata?.mimeType;
+        res.setHeader('Content-Type', mimeType || 'application/octet-stream');
+        res.setHeader('Content-Disposition', `inline; filename=\"${file.filename}\"`);
+        const stream = report_storage_1.ReportStorage.openDownloadStream(fileId);
+        stream.on('error', () => {
+            if (!res.headersSent)
+                return (0, response_1.fail)(res, 500, { message: 'Failed to read report file' });
+            res.end();
+        });
+        stream.pipe(res);
     }
     // Mock Razorpay: create order
     static async mockCreateOrder(req, res) {
