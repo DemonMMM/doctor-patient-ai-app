@@ -290,6 +290,34 @@ class ConsultationController {
             return (0, response_1.fail)(res, err.status || 500, { message: err.message || 'Server error' });
         }
     }
+    static async saveDoctorPrescription(req, res) {
+        if (!req.user)
+            return (0, response_1.fail)(res, 401, { message: 'Unauthorized' });
+        const c = await consultation_model_1.Consultation.findById(req.params.id);
+        if (!c)
+            return (0, response_1.fail)(res, 404, { message: 'Consultation not found' });
+        if (req.user.role !== 'DOCTOR' || String(c.doctorId) !== req.user.id) {
+            return (0, response_1.fail)(res, 403, { message: 'Only the assigned doctor can save prescription' });
+        }
+        const doctor = await user_model_1.User.findById(req.user.id);
+        if (!doctor || !doctor.approved)
+            return (0, response_1.fail)(res, 403, { message: 'Doctor not approved' });
+        if (c.status !== 'IN_PROGRESS') {
+            return (0, response_1.fail)(res, 400, { message: 'Consultation must be approved by doctor before prescription generation' });
+        }
+        if (c.paymentStatus !== 'PAID')
+            return (0, response_1.fail)(res, 402, { message: 'Payment required before prescription generation' });
+        const { text } = req.body;
+        if (!text?.trim())
+            return (0, response_1.fail)(res, 400, { message: 'Prescription text is required' });
+        try {
+            const prescription = await prescription_service_1.PrescriptionService.saveManual(c.id, text);
+            return (0, response_1.ok)(res, prescription, 'Prescription saved');
+        }
+        catch (err) {
+            return (0, response_1.fail)(res, err.status || 500, { message: err.message || 'Server error' });
+        }
+    }
     // Patient: view prescriptions for themselves (via consultation route for MVP)
     static async myPrescriptions(req, res) {
         if (!req.user)

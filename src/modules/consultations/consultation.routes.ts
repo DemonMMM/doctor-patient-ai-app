@@ -51,6 +51,7 @@ consultationRouter.post('/:id/ai/suggestions', requireAuth, requireRole('DOCTOR'
 
 // Prescription generation
 consultationRouter.post('/:id/ai/prescription', requireAuth, requireRole('DOCTOR'), ConsultationController.generatePrescription);
+consultationRouter.post('/:id/doctor/prescription', requireAuth, requireRole('DOCTOR'), ConsultationController.saveDoctorPrescription);
 consultationRouter.post(
   '/:id/doctor/approve',
   requireAuth,

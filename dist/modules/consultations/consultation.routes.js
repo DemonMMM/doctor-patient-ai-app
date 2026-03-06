@@ -33,5 +33,6 @@ exports.consultationRouter.post('/:id/ai/summary', auth_middleware_1.requireAuth
 exports.consultationRouter.post('/:id/ai/suggestions', auth_middleware_1.requireAuth, (0, role_middleware_1.requireRole)('DOCTOR', 'ADMIN'), ai_controller_1.AIController.generateSuggestions);
 // Prescription generation
 exports.consultationRouter.post('/:id/ai/prescription', auth_middleware_1.requireAuth, (0, role_middleware_1.requireRole)('DOCTOR'), consultation_controller_1.ConsultationController.generatePrescription);
+exports.consultationRouter.post('/:id/doctor/prescription', auth_middleware_1.requireAuth, (0, role_middleware_1.requireRole)('DOCTOR'), consultation_controller_1.ConsultationController.saveDoctorPrescription);
 exports.consultationRouter.post('/:id/doctor/approve', auth_middleware_1.requireAuth, (0, role_middleware_1.requireRole)('DOCTOR'), consultation_controller_1.ConsultationController.doctorApproveScheduled);
 exports.consultationRouter.post('/:id/doctor/complete-delete', auth_middleware_1.requireAuth, (0, role_middleware_1.requireRole)('DOCTOR'), consultation_controller_1.ConsultationController.doctorCompleteAndDelete);

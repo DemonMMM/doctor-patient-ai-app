@@ -35,5 +35,20 @@ class PrescriptionService {
     static async listForDoctor(doctorId) {
         return prescription_model_1.Prescription.find({ doctorId }).sort({ createdAt: -1 });
     }
+    static async saveManual(consultationId, text) {
+        const consultation = await consultation_model_1.Consultation.findById(consultationId);
+        if (!consultation) {
+            throw Object.assign(new Error('Consultation not found'), { status: 404 });
+        }
+        if (!text.trim()) {
+            throw Object.assign(new Error('Prescription text is required'), { status: 400 });
+        }
+        return prescription_model_1.Prescription.create({
+            consultationId: new mongoose_1.Types.ObjectId(consultation.id),
+            doctorId: consultation.doctorId,
+            patientId: consultation.patientId,
+            text: text.trim()
+        });
+    }
 }
 exports.PrescriptionService = PrescriptionService;

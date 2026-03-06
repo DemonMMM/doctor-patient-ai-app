@@ -40,4 +40,21 @@ export class PrescriptionService {
   static async listForDoctor(doctorId: string) {
     return Prescription.find({ doctorId }).sort({ createdAt: -1 });
   }
+
+  static async saveManual(consultationId: string, text: string) {
+    const consultation = await Consultation.findById(consultationId);
+    if (!consultation) {
+      throw Object.assign(new Error('Consultation not found'), { status: 404 });
+    }
+    if (!text.trim()) {
+      throw Object.assign(new Error('Prescription text is required'), { status: 400 });
+    }
+
+    return Prescription.create({
+      consultationId: new Types.ObjectId(consultation.id),
+      doctorId: consultation.doctorId,
+      patientId: consultation.patientId,
+      text: text.trim()
+    });
+  }
 }

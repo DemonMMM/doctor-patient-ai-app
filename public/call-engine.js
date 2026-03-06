@@ -17,7 +17,7 @@ const DEFAULT_ICE_SERVERS = [
   }
 ];
 
-export function useCallEngine({ api, notify, selected, canUseCall, me, isNativeApp }) {
+export function useCallEngine({ api, notify, selected, canUseCall, me, isNativeApp, sendSystemNotification }) {
   const [callJoined, setCallJoined] = useState(false);
   const [callStatus, setCallStatus] = useState('Call not started.');
   const [incomingCall, setIncomingCall] = useState(null);
@@ -376,6 +376,10 @@ export function useCallEngine({ api, notify, selected, canUseCall, me, isNativeA
           fromRole: signal.fromRole || 'Other participant'
         });
         setCallStatus('Incoming call. Accept to connect.');
+        notify(`${signal.fromRole || 'Participant'} is calling`);
+        if (sendSystemNotification) {
+          void sendSystemNotification('Incoming Call', `${signal.fromRole || 'Participant'} is calling you`);
+        }
         return;
       }
 

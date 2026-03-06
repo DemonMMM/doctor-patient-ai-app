@@ -1,6 +1,6 @@
 import { useCallEngine } from './call-engine.js';
 import { CallPane } from './call-pane.jsx';
-const { useEffect, useMemo, useState } = React;
+const { useEffect, useMemo, useRef, useState } = React;
 const DEFAULT_API_BASE = 'https://doctor-patient-ai-app.onrender.com';
 function App() {
   const isNativeApp = Boolean(window.Capacitor && (window.Capacitor.isNativePlatform?.() ?? true));
@@ -21,6 +21,8 @@ function App() {
   const [creating, setCreating] = useState(false);
   const [chatMessage, setChatMessage] = useState('');
   const [page, setPage] = useState('home');
+  const [detailTab, setDetailTab] = useState('chat');
+  const [manualPrescription, setManualPrescription] = useState('');
   const [toast, setToast] = useState({ show: false, message: '', bad: false });
   const [modal, setModal] = useState({ show: false, title: '', message: '' });
   const isLoggedIn = Boolean(token && me);
@@ -39,6 +41,24 @@ function App() {
   const apiStatus = isLoggedIn ? `Connected as ${me.role}` : 'Not connected';
   const patientLockedByPayment = isPatient && selected && selected.paymentStatus !== 'PAID';
   const canUseCall = Boolean(selected && (isDoctor || isPatient) && flags.inProgress && flags.paid);
+  const seenConsultationStateRef = useRef(new Map());
+  const lastSignalNoticeRef = useRef('');
+  const nativeNotificationPlugin = window.Capacitor?.Plugins?.LocalNotifications;
+
+  async function sendSystemNotification(title, body) {
+    if (!isNativeApp) return;
+    if (nativeNotificationPlugin?.schedule) {
+      try {
+        await nativeNotificationPlugin.requestPermissions();
+        await nativeNotificationPlugin.schedule({
+          notifications: [{ id: Date.now() % 2147483647, title, body, schedule: { at: new Date(Date.now() + 60) } }]
+        });
+        return;
+      } catch {
+        // Fall through to in-app toast only.
+      }
+    }
+  }
   function notify(message, bad = false) {
     setToast({ show: true, message, bad });
     window.clearTimeout(notify.t);
@@ -97,7 +117,7 @@ function App() {
     }
     return json;
   }
-  const call = useCallEngine({ api, notify, selected, canUseCall, me, isNativeApp });
+  const call = useCallEngine({ api, notify, selected, canUseCall, me, isNativeApp, sendSystemNotification });
   function personLabel(v) {
     if (!v) return 'N/A';
     if (typeof v === 'string') return v;
@@ -162,6 +182,44 @@ function App() {
     if (me.role === 'ADMIN') refreshAdmin().catch((e) => notify(e.message, true));
     if (me.role !== 'ADMIN') refreshPrescriptions().catch((e) => notify(e.message, true));
   }, [me]);
+  useEffect(() => {
+    if (!isNativeApp || !me) return;
+    if (me.role === 'PATIENT' || me.role === 'DOCTOR') {
+      setPage('consultations');
+      return;
+    }
+    if (me.role === 'ADMIN') setPage('home');
+  }, [isNativeApp, me?.role]);
+  useEffect(() => {
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }, [page, detailTab, selected?._id]);
+  useEffect(() => {
+    if (!isLoggedIn || !isNativeApp) return;
+    const timer = window.setInterval(async () => {
+      try {
+        const r = await api('/api/consultations/my');
+        const next = Array.isArray(r.data) ? r.data : [];
+        setConsultations(next);
+        for (const c of next) {
+          const key = String(c._id);
+          const sig = `${c.status}|${c.paymentStatus}`;
+          const prev = seenConsultationStateRef.current.get(key);
+          if (!prev) {
+            seenConsultationStateRef.current.set(key, sig);
+            continue;
+          }
+          if (prev !== sig) {
+            seenConsultationStateRef.current.set(key, sig);
+            notify(`Consultation updated: ${c.status} / ${c.paymentStatus}`);
+            await sendSystemNotification('Consultation Updated', `${c.status} / ${c.paymentStatus}`);
+          }
+        }
+      } catch {
+        // Keep app responsive if polling fails.
+      }
+    }, 9000);
+    return () => window.clearInterval(timer);
+  }, [isLoggedIn, isNativeApp, token]);
   async function loginSubmit(e) {
     e.preventDefault();
     try {
@@ -172,7 +230,7 @@ function App() {
       }
       localStorage.setItem('token', nextToken);
       setToken(nextToken);
-      setPage('consultations');
+      setPage(isNativeApp ? 'consultations' : 'consultations');
       setLogin({ email: '', password: '' });
       notify('Login successful');
     } catch (err) {
@@ -198,7 +256,7 @@ function App() {
       }
       localStorage.setItem('token', nextToken);
       setToken(nextToken);
-      setPage('consultations');
+      setPage(isNativeApp ? 'consultations' : 'consultations');
       setRegister({ name: '', email: '', password: '', role: 'PATIENT', specialization: '' });
       notify('Registration successful');
     } catch (err) {
@@ -219,6 +277,10 @@ function App() {
     setPrescriptions([]);
     setBooking({ doctorId: '', scheduledAt: '' });
     setPage('home');
+    setDetailTab('chat');
+    setManualPrescription('');
+    seenConsultationStateRef.current.clear();
+    lastSignalNoticeRef.current = '';
   }
   async function openConsultation(id) {
     const existing = consultations.find((c) => c._id === id);
@@ -232,6 +294,7 @@ function App() {
       setSelected(r.data);
       call.setCallStatus('Call not started.');
       setPage('detail');
+      if (isNativeApp) setDetailTab('chat');
       notify('Consultation loaded');
     } catch (err) {
       const msg = String(err?.message || '');
@@ -307,12 +370,11 @@ function App() {
     try {
       await api(path, { method: 'POST' });
       await refreshConsultations();
-      if (path.includes('/ai/prescription')) {
-        setSelected(null);
-      } else {
-        await openConsultation(selected._id);
-      }
+      await openConsultation(selected._id);
       if (!isAdmin) await refreshPrescriptions();
+      if (path.includes('/ai/prescription')) {
+        setDetailTab('prescription');
+      }
       notify(success);
     } catch (err) {
       notify(err.message, true);
@@ -327,6 +389,26 @@ function App() {
       await refreshConsultations();
       if (!isAdmin) await refreshPrescriptions();
       notify('Consultation marked done and deleted');
+    } catch (err) {
+      notify(err.message, true);
+    }
+  }
+  async function saveManualPrescription(e) {
+    e.preventDefault();
+    if (!selected) return;
+    if (!manualPrescription.trim()) return notify('Prescription text is required', true);
+    try {
+      await api(`/api/consultations/${selected._id}/doctor/prescription`, {
+        method: 'POST',
+        body: JSON.stringify({ text: manualPrescription.trim() })
+      });
+      setManualPrescription('');
+      await refreshConsultations();
+      await openConsultation(selected._id);
+      await refreshPrescriptions();
+      setDetailTab('prescription');
+      notify('Prescription saved');
+      await sendSystemNotification('Prescription Saved', 'Doctor has saved a prescription');
     } catch (err) {
       notify(err.message, true);
     }
@@ -356,6 +438,10 @@ function App() {
     const d = doctors.find((x) => x._id === booking.doctorId);
     return d?.consultationFee || 0;
   }, [doctors, booking.doctorId]);
+  const selectedPrescriptionList = useMemo(() => {
+    if (!selected?._id) return [];
+    return prescriptions.filter((p) => String(p.consultationId?._id || p.consultationId) === String(selected._id));
+  }, [prescriptions, selected?._id]);
   return (
     <>
       <div className="bg-orb orb-a"></div>
@@ -372,10 +458,27 @@ function App() {
       </header>
       {isLoggedIn && (
         <div className="segmented app-nav">
-          <button className={page === 'home' ? 'active' : ''} onClick={() => setPage('home')}>Home</button>
-          <button className={page === 'consultations' ? 'active' : ''} onClick={() => setPage('consultations')}>Consultations</button>
-          <button className={page === 'detail' ? 'active' : ''} onClick={() => setPage('detail')} disabled={!selected}>Detail</button>
-          {!isAdmin ? <button className={page === 'prescriptions' ? 'active' : ''} onClick={() => setPage('prescriptions')}>Prescriptions</button> : null}
+          {isNativeApp && isPatient ? (
+            <>
+              <button className={page === 'consultations' ? 'active' : ''} onClick={() => setPage('consultations')}>Consultations</button>
+              <button className={page === 'book' ? 'active' : ''} onClick={() => setPage('book')}>Book</button>
+              <button className={page === 'prescriptions' ? 'active' : ''} onClick={() => setPage('prescriptions')}>Prescriptions</button>
+              <button className={page === 'home' ? 'active' : ''} onClick={() => setPage('home')}>Profile</button>
+            </>
+          ) : isNativeApp && isDoctor ? (
+            <>
+              <button className={page === 'consultations' ? 'active' : ''} onClick={() => setPage('consultations')}>Consultations</button>
+              <button className={page === 'prescriptions' ? 'active' : ''} onClick={() => setPage('prescriptions')}>Prescriptions</button>
+              <button className={page === 'home' ? 'active' : ''} onClick={() => setPage('home')}>Profile</button>
+            </>
+          ) : (
+            <>
+              <button className={page === 'home' ? 'active' : ''} onClick={() => setPage('home')}>Home</button>
+              <button className={page === 'consultations' ? 'active' : ''} onClick={() => setPage('consultations')}>Consultations</button>
+              <button className={page === 'detail' ? 'active' : ''} onClick={() => setPage('detail')} disabled={!selected}>Detail</button>
+              {!isAdmin ? <button className={page === 'prescriptions' ? 'active' : ''} onClick={() => setPage('prescriptions')}>Prescriptions</button> : null}
+            </>
+          )}
         </div>
       )}
       <main className="layout">
@@ -431,7 +534,7 @@ function App() {
               <button className="btn ghost" onClick={logout}>Logout</button>
             </article>
           )}
-          {isPatient && page === 'home' && (
+          {isPatient && (isNativeApp ? page === 'book' : page === 'home') && (
             <article className="card">
               <div className="card-head">
                 <h2>Book Consultation</h2>
@@ -503,7 +606,9 @@ function App() {
                     <div className="meta">Doctor: {personLabel(c.doctorId)} | Patient: {personLabel(c.patientId)}</div>
                     <div className="meta">When: {c.scheduledAt ? new Date(c.scheduledAt).toLocaleString() : 'Not scheduled'}</div>
                     {locked ? <div className="meta">Waiting for doctor approval. Open unlocks after approval.</div> : null}
-                    <div className="row"><button className="btn tiny" disabled={locked} onClick={() => openConsultation(c._id)}>Open</button></div>
+                    {isPatient && locked && isNativeApp ? null : (
+                      <div className="row"><button className="btn tiny" disabled={locked} onClick={() => openConsultation(c._id)}>Open</button></div>
+                    )}
                   </div>
                 );
               })}
@@ -525,8 +630,17 @@ function App() {
                   <p>Status: {selected.status} | Payment: {selected.paymentStatus} | ID: {selected._id}</p>
                 </div>
               </div>
+              {isNativeApp && (
+                <div className="segmented detail-nav">
+                  {!patientLockedByPayment ? <button className={detailTab === 'chat' ? 'active' : ''} onClick={() => setDetailTab('chat')}>Chat</button> : null}
+                  <button className={detailTab === 'actions' ? 'active' : ''} onClick={() => setDetailTab('actions')}>Actions</button>
+                  {!patientLockedByPayment ? <button className={detailTab === 'call' ? 'active' : ''} onClick={() => setDetailTab('call')}>Call</button> : null}
+                  <button className={detailTab === 'ai' ? 'active' : ''} onClick={() => setDetailTab('ai')}>AI</button>
+                  <button className={detailTab === 'prescription' ? 'active' : ''} onClick={() => setDetailTab('prescription')}>Prescription</button>
+                </div>
+              )}
               <div className="detail-grid">
-                {!patientLockedByPayment && (
+                {!patientLockedByPayment && (!isNativeApp || detailTab === 'chat') && (
                   <section className="pane">
                     <h3>Chat</h3>
                     <div className="chat">
@@ -544,6 +658,7 @@ function App() {
                     </form>
                   </section>
                 )}
+                {(!isNativeApp || detailTab === 'actions') && (
                 <section className="pane">
                   <h3>Actions</h3>
                   {isPatient && (
@@ -580,7 +695,9 @@ function App() {
                     ))}
                   </div>
                 </section>
-                {!patientLockedByPayment ? <CallPane call={call} canUseCall={canUseCall} notify={notify} /> : null}
+                )}
+                {!patientLockedByPayment && (!isNativeApp || detailTab === 'call') ? <CallPane call={call} canUseCall={canUseCall} notify={notify} /> : null}
+                {(!isNativeApp || detailTab === 'ai') && (
                 <section className="pane full">
                   <h3>AI Output</h3>
                   <div className="text-output">
@@ -592,6 +709,28 @@ function App() {
                     <textarea readOnly value={selected.ai?.suggestions || 'No AI suggestions generated yet.'}></textarea>
                   </div>
                 </section>
+                )}
+                {(!isNativeApp || detailTab === 'prescription') && (
+                <section className="pane full">
+                  <h3>Prescription</h3>
+                  {isDoctor && (
+                    <form className="form" onSubmit={saveManualPrescription}>
+                      <label>Write Prescription
+                        <textarea value={manualPrescription} onChange={(e) => setManualPrescription(e.target.value)} placeholder="Write prescription details..." required />
+                      </label>
+                      <button className="btn primary" disabled={!flags.inProgress || !flags.paid} type="submit">Save Prescription</button>
+                    </form>
+                  )}
+                  <div className="list">
+                    {selectedPrescriptionList.length === 0 ? <div className="item"><div className="meta">No prescription saved for this consultation yet.</div></div> : selectedPrescriptionList.map((p) => (
+                      <div className="item" key={p._id}>
+                        <div className="meta">Created: {new Date(p.createdAt).toLocaleString()}</div>
+                        <pre>{p.text}</pre>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+                )}
               </div>
             </article>
           )}
