@@ -25,7 +25,9 @@ function App() {
   const [manualPrescription, setManualPrescription] = useState('');
   const [toast, setToast] = useState({ show: false, message: '', bad: false });
   const [modal, setModal] = useState({ show: false, title: '', message: '' });
+  const hasToken = Boolean(token);
   const isLoggedIn = Boolean(token && me);
+  const isRestoringSession = Boolean(hasToken && !me);
   const isAdmin = me?.role === 'ADMIN';
   const isDoctor = me?.role === 'DOCTOR';
   const isPatient = me?.role === 'PATIENT';
@@ -44,14 +46,136 @@ function App() {
   const seenConsultationStateRef = useRef(new Map());
   const lastSignalNoticeRef = useRef('');
   const nativeNotificationPlugin = window.Capacitor?.Plugins?.LocalNotifications;
+  const nativeCallNotifications = window.Capacitor?.Plugins?.CallNotifications;
+  const callNotificationIdRef = useRef(null);
+  const callRef = useRef(null);
 
-  async function sendSystemNotification(title, body) {
+  const CALLS_CHANNEL_ID = 'calls';
+  const CALL_ACTION_TYPE_ID = 'CALL_INCOMING';
+  const CALL_ACTION_ACCEPT = 'ACCEPT';
+  const CALL_ACTION_DECLINE = 'DECLINE';
+
+  useEffect(() => {
+    document.documentElement.classList.toggle('native', isNativeApp);
+    return () => document.documentElement.classList.remove('native');
+  }, [isNativeApp]);
+
+  useEffect(() => {
     if (!isNativeApp) return;
+    const plugin = nativeNotificationPlugin;
+    if (!plugin?.requestPermissions) return;
+    plugin.requestPermissions().catch(() => {
+      // Best-effort; app still works without notifications.
+    });
+  }, [isNativeApp]);
+
+  useEffect(() => {
+    if (!isNativeApp) return;
+    const plugin = nativeNotificationPlugin;
+    if (!plugin?.createChannel || !plugin?.registerActionTypes || !plugin?.addListener) return;
+
+    let actionListener = null;
+    (async () => {
+      try {
+        await plugin.requestPermissions();
+      } catch {
+        // If permission isn't granted, channel/actions setup is still best-effort.
+      }
+
+      try {
+        await plugin.createChannel({
+          id: CALLS_CHANNEL_ID,
+          name: 'Calls',
+          description: 'Incoming call alerts',
+          importance: 5,
+          visibility: 1,
+          vibration: true
+        });
+      } catch {
+        // Channel might already exist or be blocked by OS settings.
+      }
+
+      try {
+        await plugin.registerActionTypes({
+          types: [
+            {
+              id: CALL_ACTION_TYPE_ID,
+              actions: [
+                { id: CALL_ACTION_ACCEPT, title: 'Accept' },
+                { id: CALL_ACTION_DECLINE, title: 'Decline' }
+              ]
+            }
+          ]
+        });
+      } catch {
+        // Best-effort.
+      }
+
+      try {
+        actionListener = await plugin.addListener('localNotificationActionPerformed', (evt) => {
+          const actionId = evt?.actionId;
+          const currentCall = callRef.current;
+          if (actionId === CALL_ACTION_ACCEPT) {
+            void currentCall?.acceptIncomingCall?.().catch(() => {});
+          }
+          if (actionId === CALL_ACTION_DECLINE) {
+            void currentCall?.declineIncomingCall?.().catch(() => {});
+          }
+          if (plugin?.removeAllDeliveredNotifications) {
+            void plugin.removeAllDeliveredNotifications().catch(() => {});
+          }
+        });
+      } catch {
+        // Best-effort.
+      }
+    })();
+
+    return () => {
+      try {
+        actionListener?.remove?.();
+      } catch {
+        // ignore
+      }
+    };
+  }, [isNativeApp]);
+
+  async function sendSystemNotification(title, body, extra = {}) {
+    if (!isNativeApp) return;
+
+    if (nativeCallNotifications?.showIncomingCall) {
+      try {
+        await nativeCallNotifications.showIncomingCall({
+          title,
+          body,
+          consultationId: extra?.consultationId ? String(extra.consultationId) : '',
+          fromRole: extra?.fromRole ? String(extra.fromRole) : ''
+        });
+        return;
+      } catch {
+        // Fall back to LocalNotifications.
+      }
+    }
+
     if (nativeNotificationPlugin?.schedule) {
       try {
         await nativeNotificationPlugin.requestPermissions();
+        if (nativeNotificationPlugin?.removeAllDeliveredNotifications) {
+          await nativeNotificationPlugin.removeAllDeliveredNotifications().catch(() => {});
+        }
+        const id = Date.now() % 2147483647;
+        callNotificationIdRef.current = id;
         await nativeNotificationPlugin.schedule({
-          notifications: [{ id: Date.now() % 2147483647, title, body, schedule: { at: new Date(Date.now() + 60) } }]
+          notifications: [
+            {
+              id,
+              title,
+              body,
+              channelId: CALLS_CHANNEL_ID,
+              actionTypeId: CALL_ACTION_TYPE_ID,
+              ongoing: true,
+              autoCancel: false
+            }
+          ]
         });
         return;
       } catch {
@@ -59,6 +183,60 @@ function App() {
       }
     }
   }
+
+  useEffect(() => {
+    if (!isNativeApp) return;
+    if (!nativeCallNotifications?.getPendingAction || !nativeCallNotifications?.clearPendingAction) return;
+
+    let cancelled = false;
+    const tryConsume = async () => {
+      try {
+        const res = await nativeCallNotifications.getPendingAction();
+        if (cancelled) return;
+        const action = String(res?.action || '').toUpperCase();
+        if (action !== 'ACCEPT' && action !== 'DECLINE') return;
+
+        await nativeCallNotifications.clearPendingAction().catch(() => {});
+
+        const currentCall = callRef.current;
+        if (action === 'ACCEPT') {
+          if (currentCall?.incomingCall) {
+            await currentCall.acceptIncomingCall().catch(() => {});
+          }
+          return;
+        }
+        if (action === 'DECLINE') {
+          if (currentCall?.incomingCall) {
+            await currentCall.declineIncomingCall().catch(() => {});
+          }
+        }
+      } catch {
+        // ignore
+      }
+    };
+
+    tryConsume();
+    const t = window.setInterval(tryConsume, 800);
+    return () => {
+      cancelled = true;
+      window.clearInterval(t);
+    };
+  }, [isNativeApp]);
+
+  useEffect(() => {
+    if (!isNativeApp) return;
+    const plugin = nativeNotificationPlugin;
+    if (!plugin?.removeAllDeliveredNotifications) return;
+    if (call.incomingCall) return;
+    void plugin.removeAllDeliveredNotifications().catch(() => {});
+  }, [isNativeApp, call.incomingCall]);
+
+  useEffect(() => {
+    if (!isNativeApp) return;
+    if (!nativeCallNotifications?.clearIncomingCall) return;
+    if (call.incomingCall) return;
+    void nativeCallNotifications.clearIncomingCall().catch(() => {});
+  }, [isNativeApp, call.incomingCall]);
   function notify(message, bad = false) {
     setToast({ show: true, message, bad });
     window.clearTimeout(notify.t);
@@ -118,6 +296,11 @@ function App() {
     return json;
   }
   const call = useCallEngine({ api, notify, selected, canUseCall, me, isNativeApp, sendSystemNotification });
+
+  useEffect(() => {
+    callRef.current = call;
+  }, [call]);
+
   function personLabel(v) {
     if (!v) return 'N/A';
     if (typeof v === 'string') return v;
@@ -483,7 +666,16 @@ function App() {
       )}
       <main className="layout">
         <section className="stack left">
-          {!isLoggedIn && (
+          {isRestoringSession && (
+            <article className="card">
+              <div className="card-head">
+                <h2>Restoring session</h2>
+                <p>Checking your login…</p>
+              </div>
+              <button className="btn ghost" onClick={logout}>Logout</button>
+            </article>
+          )}
+          {!isLoggedIn && !isRestoringSession && (
             <>
               <article className="card">
                 <div className="card-head">
@@ -696,7 +888,9 @@ function App() {
                   </div>
                 </section>
                 )}
-                {!patientLockedByPayment && (!isNativeApp || detailTab === 'call') ? <CallPane call={call} canUseCall={canUseCall} notify={notify} /> : null}
+                {!patientLockedByPayment && (!isNativeApp || detailTab === 'call') ? (
+                  <CallPane call={call} canUseCall={canUseCall} notify={notify} isNativeApp={isNativeApp} me={me} selected={selected} />
+                ) : null}
                 {(!isNativeApp || detailTab === 'ai') && (
                 <section className="pane full">
                   <h3>AI Output</h3>

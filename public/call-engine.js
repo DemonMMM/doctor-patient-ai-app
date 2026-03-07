@@ -26,6 +26,7 @@ export function useCallEngine({ api, notify, selected, canUseCall, me, isNativeA
   const [micOn, setMicOn] = useState(true);
   const [cameraOn, setCameraOn] = useState(true);
   const [cameraFacing, setCameraFacing] = useState('user');
+  const [callHistory, setCallHistory] = useState([]);
 
   const pcRef = useRef(null);
   const localStreamRef = useRef(null);
@@ -48,16 +49,80 @@ export function useCallEngine({ api, notify, selected, canUseCall, me, isNativeA
   const preferredFacingModeRef = useRef('user');
   const pendingOfferRef = useRef(null);
   const signalCursorReadyRef = useRef(false);
+  const callSessionRef = useRef(null);
+  const callHistoryKeyRef = useRef('');
 
   const isPhoneActiveCall = Boolean(isNativeApp && (incomingCall || localMediaActive || remoteConnected));
 
+  function historyKey(consultationId, user) {
+    if (!consultationId || !user?.id) return '';
+    return `mediflow_call_history:${String(user.id)}:${String(consultationId)}`;
+  }
+
+  function loadHistoryFor(consultationId) {
+    if (!isNativeApp) {
+      callHistoryKeyRef.current = '';
+      setCallHistory([]);
+      return;
+    }
+
+    const key = historyKey(consultationId, meRef.current);
+    callHistoryKeyRef.current = key;
+    if (!key) {
+      setCallHistory([]);
+      return;
+    }
+
+    try {
+      const raw = localStorage.getItem(key);
+      const parsed = raw ? JSON.parse(raw) : [];
+      setCallHistory(Array.isArray(parsed) ? parsed : []);
+    } catch {
+      setCallHistory([]);
+    }
+  }
+
+  function persistHistory(next) {
+    const key = callHistoryKeyRef.current;
+    if (!isNativeApp || !key) return;
+    try {
+      localStorage.setItem(key, JSON.stringify(next));
+    } catch {
+      // Best-effort.
+    }
+  }
+
+  function addHistoryEntry(entry) {
+    setCallHistory((prev) => {
+      const list = Array.isArray(prev) ? prev : [];
+      const next = [entry, ...list].slice(0, 25);
+      persistHistory(next);
+      return next;
+    });
+  }
+
+  function deleteHistoryEntry(entryId) {
+    setCallHistory((prev) => {
+      const list = Array.isArray(prev) ? prev : [];
+      const next = list.filter((x) => String(x?.id) !== String(entryId));
+      persistHistory(next);
+      return next;
+    });
+  }
+
   useEffect(() => {
     selectedRef.current = selected;
+    if (selected?._id) loadHistoryFor(selected._id);
   }, [selected]);
 
   useEffect(() => {
     meRef.current = me;
   }, [me]);
+
+  useEffect(() => {
+    // Reload history on login/logout.
+    if (selectedRef.current?._id) loadHistoryFor(selectedRef.current._id);
+  }, [me?.id]);
 
   function stopPolling() {
     if (pollTimerRef.current) {
@@ -221,8 +286,8 @@ export function useCallEngine({ api, notify, selected, canUseCall, me, isNativeA
       const videoConstraints = isNativeApp
         ? {
             facingMode: { ideal: preferredFacingModeRef.current },
-            width: { ideal: 960, max: 1280 },
-            height: { ideal: 540, max: 720 },
+            width: { ideal: 640, max: 960 },
+            height: { ideal: 360, max: 540 },
             frameRate: { ideal: 24, max: 30 }
           }
         : { facingMode: { ideal: preferredFacingModeRef.current } };
@@ -252,11 +317,59 @@ export function useCallEngine({ api, notify, selected, canUseCall, me, isNativeA
     localStreamRef.current = stream;
     const audioTrack = stream.getAudioTracks()[0];
     const videoTrack = stream.getVideoTracks()[0];
+    if (videoTrack && 'contentHint' in videoTrack) {
+      try {
+        videoTrack.contentHint = 'motion';
+      } catch {
+        // Ignore when browser disallows hints.
+      }
+    }
     setLocalMediaActive(true);
     setMicOn(audioTrack ? audioTrack.enabled !== false : true);
     setCameraOn(videoTrack ? videoTrack.enabled !== false : true);
     if (localVideoRef.current) localVideoRef.current.srcObject = stream;
     return stream;
+  }
+
+  async function applySenderTuning() {
+    const pc = pcRef.current;
+    if (!pc) return;
+
+    const videoSender = pc.getSenders().find((s) => s.track && s.track.kind === 'video');
+    if (videoSender?.setParameters) {
+      try {
+        const params = videoSender.getParameters() || {};
+        params.degradationPreference = isNativeApp ? 'maintain-framerate' : 'balanced';
+        const existingEnc = Array.isArray(params.encodings) ? params.encodings : [{}];
+        params.encodings = [
+          {
+            ...existingEnc[0],
+            maxBitrate: isNativeApp ? 900_000 : 1_400_000,
+            maxFramerate: 24
+          }
+        ];
+        await videoSender.setParameters(params);
+      } catch {
+        // Best-effort; some WebViews restrict sender params.
+      }
+    }
+
+    const audioSender = pc.getSenders().find((s) => s.track && s.track.kind === 'audio');
+    if (audioSender?.setParameters) {
+      try {
+        const params = audioSender.getParameters() || {};
+        const existingEnc = Array.isArray(params.encodings) ? params.encodings : [{}];
+        params.encodings = [
+          {
+            ...existingEnc[0],
+            maxBitrate: 64_000
+          }
+        ];
+        await audioSender.setParameters(params);
+      } catch {
+        // Best-effort.
+      }
+    }
   }
 
   async function toggleMic() {
@@ -323,6 +436,8 @@ export function useCallEngine({ api, notify, selected, canUseCall, me, isNativeA
       }
     }
 
+    await applySenderTuning();
+
     preferredFacingModeRef.current = nextFacing;
     setCameraFacing(nextFacing);
     setCallStatus(nextFacing === 'user' ? 'Front camera active' : 'Back camera active');
@@ -359,7 +474,7 @@ export function useCallEngine({ api, notify, selected, canUseCall, me, isNativeA
       }
     }
 
-    // Let browser adapt bitrate dynamically for better long-call stability.
+    await applySenderTuning();
   }
 
   async function handleIncomingSignal(signal) {
@@ -378,7 +493,10 @@ export function useCallEngine({ api, notify, selected, canUseCall, me, isNativeA
         setCallStatus('Incoming call. Accept to connect.');
         notify(`${signal.fromRole || 'Participant'} is calling`);
         if (sendSystemNotification) {
-          void sendSystemNotification('Incoming Call', `${signal.fromRole || 'Participant'} is calling you`);
+          void sendSystemNotification('Incoming Call', `${signal.fromRole || 'Participant'} is calling you`, {
+            consultationId: callConsultationIdRef.current || selectedRef.current?._id || null,
+            fromRole: signal.fromRole || 'Participant'
+          });
         }
         return;
       }
@@ -491,6 +609,11 @@ export function useCallEngine({ api, notify, selected, canUseCall, me, isNativeA
     await ensureSignalPolling();
     await attachLocalTracks();
 
+    callSessionRef.current = {
+      id: `call_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+      startedAt: Date.now()
+    };
+
     const pc = ensurePeerConnection();
     reconnectAttemptsRef.current = 0;
     let offer;
@@ -520,6 +643,11 @@ export function useCallEngine({ api, notify, selected, canUseCall, me, isNativeA
     const incomingOffer = pendingOfferRef.current;
     pendingOfferRef.current = null;
 
+    callSessionRef.current = {
+      id: `call_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+      startedAt: Date.now()
+    };
+
     await pc.setRemoteDescription(new RTCSessionDescription(incomingOffer));
     await flushPendingIceCandidates();
     const answer = await pc.createAnswer();
@@ -532,11 +660,13 @@ export function useCallEngine({ api, notify, selected, canUseCall, me, isNativeA
   async function declineIncomingCall() {
     pendingOfferRef.current = null;
     setIncomingCall(null);
+    callSessionRef.current = null;
     await sendCallSignal('hangup', { reason: 'declined' });
     setCallStatus('Call declined');
   }
 
   async function endCall(sendHangup = true, keepListening = true) {
+    const session = callSessionRef.current;
     if (sendHangup && callJoinedRef.current) {
       try {
         await sendCallSignal('hangup', { reason: 'ended' });
@@ -565,6 +695,22 @@ export function useCallEngine({ api, notify, selected, canUseCall, me, isNativeA
     setMicOn(true);
     setCameraOn(true);
     setCallStatus('Call ended');
+
+    if (isNativeApp && session) {
+      const endedAt = Date.now();
+      const startedAt = Number(session.startedAt || 0);
+      const durationMs = Math.max(0, endedAt - startedAt);
+      if (startedAt && durationMs > 1500) {
+        addHistoryEntry({
+          id: session.id,
+          startedAt,
+          endedAt,
+          durationMs,
+          role: meRef.current?.role || 'UNKNOWN'
+        });
+      }
+    }
+    callSessionRef.current = null;
 
     if (keepListening && selectedRef.current?._id && canUseCall) {
       await ensureSignalPolling();
@@ -627,6 +773,8 @@ export function useCallEngine({ api, notify, selected, canUseCall, me, isNativeA
     micOn,
     cameraOn,
     cameraFacing,
+    callHistory,
+    deleteHistoryEntry,
     isPhoneActiveCall,
     localVideoRef,
     remoteVideoRef,

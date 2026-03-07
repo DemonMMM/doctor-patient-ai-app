@@ -27,6 +27,7 @@
     const [micOn, setMicOn] = useState(true);
     const [cameraOn, setCameraOn] = useState(true);
     const [cameraFacing, setCameraFacing] = useState("user");
+    const [callHistory, setCallHistory] = useState([]);
     const pcRef = useRef(null);
     const localStreamRef = useRef(null);
     const pollTimerRef = useRef(null);
@@ -48,13 +49,68 @@
     const preferredFacingModeRef = useRef("user");
     const pendingOfferRef = useRef(null);
     const signalCursorReadyRef = useRef(false);
+    const callSessionRef = useRef(null);
+    const callHistoryKeyRef = useRef("");
     const isPhoneActiveCall = Boolean(isNativeApp && (incomingCall || localMediaActive || remoteConnected));
+    function historyKey(consultationId, user) {
+      if (!consultationId || !(user == null ? void 0 : user.id)) return "";
+      return `mediflow_call_history:${String(user.id)}:${String(consultationId)}`;
+    }
+    function loadHistoryFor(consultationId) {
+      if (!isNativeApp) {
+        callHistoryKeyRef.current = "";
+        setCallHistory([]);
+        return;
+      }
+      const key = historyKey(consultationId, meRef.current);
+      callHistoryKeyRef.current = key;
+      if (!key) {
+        setCallHistory([]);
+        return;
+      }
+      try {
+        const raw = localStorage.getItem(key);
+        const parsed = raw ? JSON.parse(raw) : [];
+        setCallHistory(Array.isArray(parsed) ? parsed : []);
+      } catch {
+        setCallHistory([]);
+      }
+    }
+    function persistHistory(next) {
+      const key = callHistoryKeyRef.current;
+      if (!isNativeApp || !key) return;
+      try {
+        localStorage.setItem(key, JSON.stringify(next));
+      } catch {
+      }
+    }
+    function addHistoryEntry(entry) {
+      setCallHistory((prev) => {
+        const list = Array.isArray(prev) ? prev : [];
+        const next = [entry, ...list].slice(0, 25);
+        persistHistory(next);
+        return next;
+      });
+    }
+    function deleteHistoryEntry(entryId) {
+      setCallHistory((prev) => {
+        const list = Array.isArray(prev) ? prev : [];
+        const next = list.filter((x) => String(x == null ? void 0 : x.id) !== String(entryId));
+        persistHistory(next);
+        return next;
+      });
+    }
     useEffect(() => {
       selectedRef.current = selected;
+      if (selected == null ? void 0 : selected._id) loadHistoryFor(selected._id);
     }, [selected]);
     useEffect(() => {
       meRef.current = me;
     }, [me]);
+    useEffect(() => {
+      var _a;
+      if ((_a = selectedRef.current) == null ? void 0 : _a._id) loadHistoryFor(selectedRef.current._id);
+    }, [me == null ? void 0 : me.id]);
     function stopPolling() {
       if (pollTimerRef.current) {
         window.clearInterval(pollTimerRef.current);
@@ -203,8 +259,8 @@
       try {
         const videoConstraints = isNativeApp ? {
           facingMode: { ideal: preferredFacingModeRef.current },
-          width: { ideal: 960, max: 1280 },
-          height: { ideal: 540, max: 720 },
+          width: { ideal: 640, max: 960 },
+          height: { ideal: 360, max: 540 },
           frameRate: { ideal: 24, max: 30 }
         } : { facingMode: { ideal: preferredFacingModeRef.current } };
         stream = await navigator.mediaDevices.getUserMedia({
@@ -231,11 +287,53 @@
       localStreamRef.current = stream;
       const audioTrack = stream.getAudioTracks()[0];
       const videoTrack = stream.getVideoTracks()[0];
+      if (videoTrack && "contentHint" in videoTrack) {
+        try {
+          videoTrack.contentHint = "motion";
+        } catch {
+        }
+      }
       setLocalMediaActive(true);
       setMicOn(audioTrack ? audioTrack.enabled !== false : true);
       setCameraOn(videoTrack ? videoTrack.enabled !== false : true);
       if (localVideoRef.current) localVideoRef.current.srcObject = stream;
       return stream;
+    }
+    async function applySenderTuning() {
+      const pc = pcRef.current;
+      if (!pc) return;
+      const videoSender = pc.getSenders().find((s) => s.track && s.track.kind === "video");
+      if (videoSender == null ? void 0 : videoSender.setParameters) {
+        try {
+          const params = videoSender.getParameters() || {};
+          params.degradationPreference = isNativeApp ? "maintain-framerate" : "balanced";
+          const existingEnc = Array.isArray(params.encodings) ? params.encodings : [{}];
+          params.encodings = [
+            {
+              ...existingEnc[0],
+              maxBitrate: isNativeApp ? 9e5 : 14e5,
+              maxFramerate: 24
+            }
+          ];
+          await videoSender.setParameters(params);
+        } catch {
+        }
+      }
+      const audioSender = pc.getSenders().find((s) => s.track && s.track.kind === "audio");
+      if (audioSender == null ? void 0 : audioSender.setParameters) {
+        try {
+          const params = audioSender.getParameters() || {};
+          const existingEnc = Array.isArray(params.encodings) ? params.encodings : [{}];
+          params.encodings = [
+            {
+              ...existingEnc[0],
+              maxBitrate: 64e3
+            }
+          ];
+          await audioSender.setParameters(params);
+        } catch {
+        }
+      }
     }
     async function toggleMic() {
       const stream = await ensureLocalStream();
@@ -293,6 +391,7 @@
           pc.addTrack(replacement, stream);
         }
       }
+      await applySenderTuning();
       preferredFacingModeRef.current = nextFacing;
       setCameraFacing(nextFacing);
       setCallStatus(nextFacing === "user" ? "Front camera active" : "Back camera active");
@@ -322,9 +421,10 @@
           pc.addTrack(track, stream);
         }
       }
+      await applySenderTuning();
     }
     async function handleIncomingSignal(signal) {
-      var _a, _b, _c, _d;
+      var _a, _b, _c, _d, _e;
       const pc = ensurePeerConnection();
       const meRole = (_a = meRef.current) == null ? void 0 : _a.role;
       const polite = meRole === "PATIENT";
@@ -339,7 +439,10 @@
           setCallStatus("Incoming call. Accept to connect.");
           notify(`${signal.fromRole || "Participant"} is calling`);
           if (sendSystemNotification) {
-            void sendSystemNotification("Incoming Call", `${signal.fromRole || "Participant"} is calling you`);
+            void sendSystemNotification("Incoming Call", `${signal.fromRole || "Participant"} is calling you`, {
+              consultationId: callConsultationIdRef.current || ((_e = selectedRef.current) == null ? void 0 : _e._id) || null,
+              fromRole: signal.fromRole || "Participant"
+            });
           }
           return;
         }
@@ -433,6 +536,10 @@
       if (!canUseCall) return;
       await ensureSignalPolling();
       await attachLocalTracks();
+      callSessionRef.current = {
+        id: `call_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+        startedAt: Date.now()
+      };
       const pc = ensurePeerConnection();
       reconnectAttemptsRef.current = 0;
       let offer;
@@ -456,6 +563,10 @@
       const pc = ensurePeerConnection();
       const incomingOffer = pendingOfferRef.current;
       pendingOfferRef.current = null;
+      callSessionRef.current = {
+        id: `call_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+        startedAt: Date.now()
+      };
       await pc.setRemoteDescription(new RTCSessionDescription(incomingOffer));
       await flushPendingIceCandidates();
       const answer = await pc.createAnswer();
@@ -467,11 +578,13 @@
     async function declineIncomingCall() {
       pendingOfferRef.current = null;
       setIncomingCall(null);
+      callSessionRef.current = null;
       await sendCallSignal("hangup", { reason: "declined" });
       setCallStatus("Call declined");
     }
     async function endCall(sendHangup = true, keepListening = true) {
-      var _a;
+      var _a, _b;
+      const session = callSessionRef.current;
       if (sendHangup && callJoinedRef.current) {
         try {
           await sendCallSignal("hangup", { reason: "ended" });
@@ -495,7 +608,22 @@
       setMicOn(true);
       setCameraOn(true);
       setCallStatus("Call ended");
-      if (keepListening && ((_a = selectedRef.current) == null ? void 0 : _a._id) && canUseCall) {
+      if (isNativeApp && session) {
+        const endedAt = Date.now();
+        const startedAt = Number(session.startedAt || 0);
+        const durationMs = Math.max(0, endedAt - startedAt);
+        if (startedAt && durationMs > 1500) {
+          addHistoryEntry({
+            id: session.id,
+            startedAt,
+            endedAt,
+            durationMs,
+            role: ((_a = meRef.current) == null ? void 0 : _a.role) || "UNKNOWN"
+          });
+        }
+      }
+      callSessionRef.current = null;
+      if (keepListening && ((_b = selectedRef.current) == null ? void 0 : _b._id) && canUseCall) {
         await ensureSignalPolling();
         setCallStatus("Ready for calls");
       } else {
@@ -551,6 +679,8 @@
       micOn,
       cameraOn,
       cameraFacing,
+      callHistory,
+      deleteHistoryEntry,
       isPhoneActiveCall,
       localVideoRef,
       remoteVideoRef,
@@ -568,15 +698,33 @@
   }
 
   // public/call-pane.jsx
-  function CallPane({ call, canUseCall, notify }) {
-    return /* @__PURE__ */ React.createElement("section", { className: "pane full call-pane" }, /* @__PURE__ */ React.createElement("h3", null, "Video Call"), /* @__PURE__ */ React.createElement("p", { className: "meta-line" }, "Tap Call to ring the other person. They can accept or decline."), /* @__PURE__ */ React.createElement("div", { className: "video-grid" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", null, "Local"), /* @__PURE__ */ React.createElement("video", { ref: call.localVideoRef, autoPlay: true, muted: true, playsInline: true })), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", null, "Remote"), /* @__PURE__ */ React.createElement("video", { ref: call.remoteVideoRef, autoPlay: true, playsInline: true }))), call.incomingCall && /* @__PURE__ */ React.createElement("div", { className: "call-incoming" }, /* @__PURE__ */ React.createElement("strong", null, "Incoming call"), /* @__PURE__ */ React.createElement("span", null, call.incomingCall.fromRole, " is calling")), /* @__PURE__ */ React.createElement("div", { className: "actions-inline" }, !call.incomingCall && !call.localMediaActive && !call.remoteConnected ? /* @__PURE__ */ React.createElement("button", { className: "btn primary", disabled: !canUseCall, onClick: () => call.startCall().catch((e) => notify(e.message, true)) }, "Call") : /* @__PURE__ */ React.createElement(React.Fragment, null, call.incomingCall ? /* @__PURE__ */ React.createElement("button", { className: "btn primary", disabled: !canUseCall, onClick: () => call.acceptIncomingCall().catch((e) => notify(e.message, true)) }, "Accept") : null, call.incomingCall ? /* @__PURE__ */ React.createElement("button", { className: "btn", disabled: !canUseCall, onClick: () => call.declineIncomingCall().catch((e) => notify(e.message, true)) }, "Decline") : null), /* @__PURE__ */ React.createElement("button", { className: "btn ghost", disabled: !call.localMediaActive && !call.remoteConnected && !call.incomingCall, onClick: () => call.endCall(true).catch((e) => notify(e.message, true)) }, "End")), /* @__PURE__ */ React.createElement("div", { className: "actions-inline" }, /* @__PURE__ */ React.createElement("button", { className: "btn tiny", disabled: !call.localMediaActive, onClick: () => call.toggleMic().catch((e) => notify(e.message, true)) }, call.micOn ? "Mute Mic" : "Unmute Mic"), /* @__PURE__ */ React.createElement("button", { className: "btn tiny", disabled: !call.localMediaActive, onClick: () => call.toggleCamera().catch((e) => notify(e.message, true)) }, call.cameraOn ? "Turn Camera Off" : "Turn Camera On"), /* @__PURE__ */ React.createElement("button", { className: "btn tiny", disabled: !call.localMediaActive, onClick: () => call.switchCamera().catch((e) => notify(e.message, true)) }, "Switch Camera (", call.cameraFacing === "user" ? "Front" : "Back", ")")), /* @__PURE__ */ React.createElement("p", { className: "meta-line" }, call.callStatus));
+  var { useMemo } = React;
+  function formatDuration(ms) {
+    const total = Math.max(0, Math.round(ms / 1e3));
+    const m = Math.floor(total / 60);
+    const s = total % 60;
+    return m > 0 ? `${m}m ${String(s).padStart(2, "0")}s` : `${s}s`;
+  }
+  function CallPane({ call, canUseCall, notify, isNativeApp, me, selected }) {
+    const counterpartLabel = useMemo(() => {
+      var _a, _b;
+      if (!selected) return "";
+      if ((me == null ? void 0 : me.role) === "PATIENT") return ((_a = selected == null ? void 0 : selected.doctorId) == null ? void 0 : _a.name) ? `Doctor ${selected.doctorId.name}` : "Doctor";
+      if ((me == null ? void 0 : me.role) === "DOCTOR") return ((_b = selected == null ? void 0 : selected.patientId) == null ? void 0 : _b.name) ? `Patient ${selected.patientId.name}` : "Patient";
+      return "Participant";
+    }, [me == null ? void 0 : me.role, selected]);
+    if (!isNativeApp) {
+      return /* @__PURE__ */ React.createElement("section", { className: "pane full call-pane" }, /* @__PURE__ */ React.createElement("h3", null, "Video Call"), /* @__PURE__ */ React.createElement("p", { className: "meta-line" }, "Tap Call to ring the other person. They can accept or decline."), /* @__PURE__ */ React.createElement("div", { className: "video-grid" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", null, "Local"), /* @__PURE__ */ React.createElement("video", { ref: call.localVideoRef, autoPlay: true, muted: true, playsInline: true })), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", null, "Remote"), /* @__PURE__ */ React.createElement("video", { ref: call.remoteVideoRef, autoPlay: true, playsInline: true }))), call.incomingCall && /* @__PURE__ */ React.createElement("div", { className: "call-incoming" }, /* @__PURE__ */ React.createElement("strong", null, "Incoming call"), /* @__PURE__ */ React.createElement("span", null, call.incomingCall.fromRole, " is calling")), /* @__PURE__ */ React.createElement("div", { className: "actions-inline" }, !call.incomingCall && !call.localMediaActive && !call.remoteConnected ? /* @__PURE__ */ React.createElement("button", { className: "btn primary", disabled: !canUseCall, onClick: () => call.startCall().catch((e) => notify(e.message, true)) }, "Call") : /* @__PURE__ */ React.createElement(React.Fragment, null, call.incomingCall ? /* @__PURE__ */ React.createElement("button", { className: "btn primary", disabled: !canUseCall, onClick: () => call.acceptIncomingCall().catch((e) => notify(e.message, true)) }, "Accept") : null, call.incomingCall ? /* @__PURE__ */ React.createElement("button", { className: "btn", disabled: !canUseCall, onClick: () => call.declineIncomingCall().catch((e) => notify(e.message, true)) }, "Decline") : null), /* @__PURE__ */ React.createElement("button", { className: "btn ghost", disabled: !call.localMediaActive && !call.remoteConnected && !call.incomingCall, onClick: () => call.endCall(true).catch((e) => notify(e.message, true)) }, "End")), /* @__PURE__ */ React.createElement("div", { className: "actions-inline" }, /* @__PURE__ */ React.createElement("button", { className: "btn tiny", disabled: !call.localMediaActive, onClick: () => call.toggleMic().catch((e) => notify(e.message, true)) }, call.micOn ? "Mute Mic" : "Unmute Mic"), /* @__PURE__ */ React.createElement("button", { className: "btn tiny", disabled: !call.localMediaActive, onClick: () => call.toggleCamera().catch((e) => notify(e.message, true)) }, call.cameraOn ? "Turn Camera Off" : "Turn Camera On"), /* @__PURE__ */ React.createElement("button", { className: "btn tiny", disabled: !call.localMediaActive, onClick: () => call.switchCamera().catch((e) => notify(e.message, true)) }, "Switch Camera (", call.cameraFacing === "user" ? "Front" : "Back", ")")), /* @__PURE__ */ React.createElement("p", { className: "meta-line" }, call.callStatus));
+    }
+    const fullscreen = Boolean(call == null ? void 0 : call.isPhoneActiveCall);
+    return /* @__PURE__ */ React.createElement("section", { className: `pane full call-pane call-pane-native${fullscreen ? " call-fullscreen" : ""}` }, !fullscreen ? /* @__PURE__ */ React.createElement("h3", null, "Video Call") : null, !fullscreen ? /* @__PURE__ */ React.createElement("p", { className: "meta-line" }, "Call ", counterpartLabel, ". Previous calls show below.") : null, /* @__PURE__ */ React.createElement("div", { className: "call-stage" }, /* @__PURE__ */ React.createElement("video", { className: "call-remote", ref: call.remoteVideoRef, autoPlay: true, playsInline: true }), /* @__PURE__ */ React.createElement("video", { className: "call-local", ref: call.localVideoRef, autoPlay: true, muted: true, playsInline: true }), call.incomingCall && /* @__PURE__ */ React.createElement("div", { className: "call-incoming-overlay" }, /* @__PURE__ */ React.createElement("strong", null, "Incoming call"), /* @__PURE__ */ React.createElement("span", null, call.incomingCall.fromRole, " is calling"), /* @__PURE__ */ React.createElement("div", { className: "actions-inline" }, /* @__PURE__ */ React.createElement("button", { className: "btn primary", disabled: !canUseCall, onClick: () => call.acceptIncomingCall().catch((e) => notify(e.message, true)) }, "Accept"), /* @__PURE__ */ React.createElement("button", { className: "btn", disabled: !canUseCall, onClick: () => call.declineIncomingCall().catch((e) => notify(e.message, true)) }, "Decline"))), !call.incomingCall && !call.localMediaActive && !call.remoteConnected ? /* @__PURE__ */ React.createElement("div", { className: "call-idle-overlay" }, /* @__PURE__ */ React.createElement("button", { className: "btn primary", disabled: !canUseCall, onClick: () => call.startCall().catch((e) => notify(e.message, true)) }, "Call ", counterpartLabel), /* @__PURE__ */ React.createElement("div", { className: "meta-line" }, call.callStatus)) : /* @__PURE__ */ React.createElement("div", { className: "call-controls" }, /* @__PURE__ */ React.createElement("button", { className: "btn tiny", disabled: !call.localMediaActive, onClick: () => call.toggleMic().catch((e) => notify(e.message, true)) }, call.micOn ? "Mute" : "Unmute"), /* @__PURE__ */ React.createElement("button", { className: "btn tiny", disabled: !call.localMediaActive, onClick: () => call.toggleCamera().catch((e) => notify(e.message, true)) }, call.cameraOn ? "Camera Off" : "Camera On"), /* @__PURE__ */ React.createElement("button", { className: "btn tiny", disabled: !call.localMediaActive, onClick: () => call.switchCamera().catch((e) => notify(e.message, true)) }, "Switch (", call.cameraFacing === "user" ? "Front" : "Back", ")"), /* @__PURE__ */ React.createElement("button", { className: "btn ghost", disabled: !call.localMediaActive && !call.remoteConnected && !call.incomingCall, onClick: () => call.endCall(true).catch((e) => notify(e.message, true)) }, "End"))), !call.localMediaActive && !call.remoteConnected && !call.incomingCall && /* @__PURE__ */ React.createElement("div", { className: "call-history" }, /* @__PURE__ */ React.createElement("div", { className: "list-head" }, /* @__PURE__ */ React.createElement("h3", null, "Previous Calls")), /* @__PURE__ */ React.createElement("div", { className: "list compact" }, (call.callHistory || []).length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "item" }, /* @__PURE__ */ React.createElement("div", { className: "meta" }, "No previous calls yet.")) : (call.callHistory || []).map((h) => /* @__PURE__ */ React.createElement("div", { className: "item", key: h.id }, /* @__PURE__ */ React.createElement("div", { className: "title" }, new Date(h.startedAt).toLocaleString()), /* @__PURE__ */ React.createElement("div", { className: "meta" }, "Duration: ", formatDuration(h.durationMs || 0)), /* @__PURE__ */ React.createElement("div", { className: "row" }, /* @__PURE__ */ React.createElement("button", { className: "btn tiny ghost", onClick: () => call.deleteHistoryEntry(h.id) }, "Delete")))))));
   }
 
   // public/app.jsx
-  var { useEffect: useEffect2, useMemo, useRef: useRef2, useState: useState2 } = React;
+  var { useEffect: useEffect2, useMemo: useMemo2, useRef: useRef2, useState: useState2 } = React;
   var DEFAULT_API_BASE = "https://doctor-patient-ai-app.onrender.com";
   function App() {
-    var _a, _b, _c, _d, _e, _f, _g;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i;
     const isNativeApp = Boolean(window.Capacitor && ((_c = (_b = (_a = window.Capacitor).isNativePlatform) == null ? void 0 : _b.call(_a)) != null ? _c : true));
     const [token, setToken] = useState2(localStorage.getItem("token") || "");
     const apiBase = DEFAULT_API_BASE;
@@ -599,11 +747,13 @@
     const [manualPrescription, setManualPrescription] = useState2("");
     const [toast, setToast] = useState2({ show: false, message: "", bad: false });
     const [modal, setModal] = useState2({ show: false, title: "", message: "" });
+    const hasToken = Boolean(token);
     const isLoggedIn = Boolean(token && me);
+    const isRestoringSession = Boolean(hasToken && !me);
     const isAdmin = (me == null ? void 0 : me.role) === "ADMIN";
     const isDoctor = (me == null ? void 0 : me.role) === "DOCTOR";
     const isPatient = (me == null ? void 0 : me.role) === "PATIENT";
-    const flags = useMemo(() => {
+    const flags = useMemo2(() => {
       const s = (selected == null ? void 0 : selected.status) || "";
       const p = (selected == null ? void 0 : selected.paymentStatus) || "";
       return {
@@ -618,19 +768,180 @@
     const seenConsultationStateRef = useRef2(/* @__PURE__ */ new Map());
     const lastSignalNoticeRef = useRef2("");
     const nativeNotificationPlugin = (_e = (_d = window.Capacitor) == null ? void 0 : _d.Plugins) == null ? void 0 : _e.LocalNotifications;
-    async function sendSystemNotification(title, body) {
+    const nativeCallNotifications = (_g = (_f = window.Capacitor) == null ? void 0 : _f.Plugins) == null ? void 0 : _g.CallNotifications;
+    const callNotificationIdRef = useRef2(null);
+    const callRef = useRef2(null);
+    const CALLS_CHANNEL_ID = "calls";
+    const CALL_ACTION_TYPE_ID = "CALL_INCOMING";
+    const CALL_ACTION_ACCEPT = "ACCEPT";
+    const CALL_ACTION_DECLINE = "DECLINE";
+    useEffect2(() => {
+      document.documentElement.classList.toggle("native", isNativeApp);
+      return () => document.documentElement.classList.remove("native");
+    }, [isNativeApp]);
+    useEffect2(() => {
       if (!isNativeApp) return;
+      const plugin = nativeNotificationPlugin;
+      if (!(plugin == null ? void 0 : plugin.requestPermissions)) return;
+      plugin.requestPermissions().catch(() => {
+      });
+    }, [isNativeApp]);
+    useEffect2(() => {
+      if (!isNativeApp) return;
+      const plugin = nativeNotificationPlugin;
+      if (!(plugin == null ? void 0 : plugin.createChannel) || !(plugin == null ? void 0 : plugin.registerActionTypes) || !(plugin == null ? void 0 : plugin.addListener)) return;
+      let actionListener = null;
+      (async () => {
+        try {
+          await plugin.requestPermissions();
+        } catch {
+        }
+        try {
+          await plugin.createChannel({
+            id: CALLS_CHANNEL_ID,
+            name: "Calls",
+            description: "Incoming call alerts",
+            importance: 5,
+            visibility: 1,
+            vibration: true
+          });
+        } catch {
+        }
+        try {
+          await plugin.registerActionTypes({
+            types: [
+              {
+                id: CALL_ACTION_TYPE_ID,
+                actions: [
+                  { id: CALL_ACTION_ACCEPT, title: "Accept" },
+                  { id: CALL_ACTION_DECLINE, title: "Decline" }
+                ]
+              }
+            ]
+          });
+        } catch {
+        }
+        try {
+          actionListener = await plugin.addListener("localNotificationActionPerformed", (evt) => {
+            var _a2, _b2;
+            const actionId = evt == null ? void 0 : evt.actionId;
+            const currentCall = callRef.current;
+            if (actionId === CALL_ACTION_ACCEPT) {
+              void ((_a2 = currentCall == null ? void 0 : currentCall.acceptIncomingCall) == null ? void 0 : _a2.call(currentCall).catch(() => {
+              }));
+            }
+            if (actionId === CALL_ACTION_DECLINE) {
+              void ((_b2 = currentCall == null ? void 0 : currentCall.declineIncomingCall) == null ? void 0 : _b2.call(currentCall).catch(() => {
+              }));
+            }
+            if (plugin == null ? void 0 : plugin.removeAllDeliveredNotifications) {
+              void plugin.removeAllDeliveredNotifications().catch(() => {
+              });
+            }
+          });
+        } catch {
+        }
+      })();
+      return () => {
+        var _a2;
+        try {
+          (_a2 = actionListener == null ? void 0 : actionListener.remove) == null ? void 0 : _a2.call(actionListener);
+        } catch {
+        }
+      };
+    }, [isNativeApp]);
+    async function sendSystemNotification(title, body, extra = {}) {
+      if (!isNativeApp) return;
+      if (nativeCallNotifications == null ? void 0 : nativeCallNotifications.showIncomingCall) {
+        try {
+          await nativeCallNotifications.showIncomingCall({
+            title,
+            body,
+            consultationId: (extra == null ? void 0 : extra.consultationId) ? String(extra.consultationId) : "",
+            fromRole: (extra == null ? void 0 : extra.fromRole) ? String(extra.fromRole) : ""
+          });
+          return;
+        } catch {
+        }
+      }
       if (nativeNotificationPlugin == null ? void 0 : nativeNotificationPlugin.schedule) {
         try {
           await nativeNotificationPlugin.requestPermissions();
+          if (nativeNotificationPlugin == null ? void 0 : nativeNotificationPlugin.removeAllDeliveredNotifications) {
+            await nativeNotificationPlugin.removeAllDeliveredNotifications().catch(() => {
+            });
+          }
+          const id = Date.now() % 2147483647;
+          callNotificationIdRef.current = id;
           await nativeNotificationPlugin.schedule({
-            notifications: [{ id: Date.now() % 2147483647, title, body, schedule: { at: new Date(Date.now() + 60) } }]
+            notifications: [
+              {
+                id,
+                title,
+                body,
+                channelId: CALLS_CHANNEL_ID,
+                actionTypeId: CALL_ACTION_TYPE_ID,
+                ongoing: true,
+                autoCancel: false
+              }
+            ]
           });
           return;
         } catch {
         }
       }
     }
+    useEffect2(() => {
+      if (!isNativeApp) return;
+      if (!(nativeCallNotifications == null ? void 0 : nativeCallNotifications.getPendingAction) || !(nativeCallNotifications == null ? void 0 : nativeCallNotifications.clearPendingAction)) return;
+      let cancelled = false;
+      const tryConsume = async () => {
+        try {
+          const res = await nativeCallNotifications.getPendingAction();
+          if (cancelled) return;
+          const action = String((res == null ? void 0 : res.action) || "").toUpperCase();
+          if (action !== "ACCEPT" && action !== "DECLINE") return;
+          await nativeCallNotifications.clearPendingAction().catch(() => {
+          });
+          const currentCall = callRef.current;
+          if (action === "ACCEPT") {
+            if (currentCall == null ? void 0 : currentCall.incomingCall) {
+              await currentCall.acceptIncomingCall().catch(() => {
+              });
+            }
+            return;
+          }
+          if (action === "DECLINE") {
+            if (currentCall == null ? void 0 : currentCall.incomingCall) {
+              await currentCall.declineIncomingCall().catch(() => {
+              });
+            }
+          }
+        } catch {
+        }
+      };
+      tryConsume();
+      const t = window.setInterval(tryConsume, 800);
+      return () => {
+        cancelled = true;
+        window.clearInterval(t);
+      };
+    }, [isNativeApp]);
+    useEffect2(() => {
+      if (!isNativeApp) return;
+      const plugin = nativeNotificationPlugin;
+      if (!(plugin == null ? void 0 : plugin.removeAllDeliveredNotifications)) return;
+      if (call.incomingCall) return;
+      void plugin.removeAllDeliveredNotifications().catch(() => {
+      });
+    }, [isNativeApp, call.incomingCall]);
+    useEffect2(() => {
+      if (!isNativeApp) return;
+      if (!(nativeCallNotifications == null ? void 0 : nativeCallNotifications.clearIncomingCall)) return;
+      if (call.incomingCall) return;
+      void nativeCallNotifications.clearIncomingCall().catch(() => {
+      });
+    }, [isNativeApp, call.incomingCall]);
     function notify(message, bad = false) {
       setToast({ show: true, message, bad });
       window.clearTimeout(notify.t);
@@ -691,6 +1002,9 @@
       return json;
     }
     const call = useCallEngine({ api, notify, selected, canUseCall, me, isNativeApp, sendSystemNotification });
+    useEffect2(() => {
+      callRef.current = call;
+    }, [call]);
     function personLabel(v) {
       if (!v) return "N/A";
       if (typeof v === "string") return v;
@@ -1009,21 +1323,21 @@
         notify(err.message, true);
       }
     }
-    const selectedDoctorFee = useMemo(() => {
+    const selectedDoctorFee = useMemo2(() => {
       const d = doctors.find((x) => x._id === booking.doctorId);
       return (d == null ? void 0 : d.consultationFee) || 0;
     }, [doctors, booking.doctorId]);
-    const selectedPrescriptionList = useMemo(() => {
+    const selectedPrescriptionList = useMemo2(() => {
       if (!(selected == null ? void 0 : selected._id)) return [];
       return prescriptions.filter((p) => {
         var _a2;
         return String(((_a2 = p.consultationId) == null ? void 0 : _a2._id) || p.consultationId) === String(selected._id);
       });
     }, [prescriptions, selected == null ? void 0 : selected._id]);
-    return /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "bg-orb orb-a" }), /* @__PURE__ */ React.createElement("div", { className: "bg-orb orb-b" }), /* @__PURE__ */ React.createElement("div", { className: "bg-grid" }), /* @__PURE__ */ React.createElement("header", { className: "topbar" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "eyebrow" }, "Doctor + Patient AI Platform"), /* @__PURE__ */ React.createElement("h1", null, "MediFlow Console")), /* @__PURE__ */ React.createElement("div", { className: "status-wrap" }, /* @__PURE__ */ React.createElement("span", { className: `pill ${isLoggedIn ? "good" : "neutral"}` }, apiStatus))), isLoggedIn && /* @__PURE__ */ React.createElement("div", { className: "segmented app-nav" }, isNativeApp && isPatient ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("button", { className: page === "consultations" ? "active" : "", onClick: () => setPage("consultations") }, "Consultations"), /* @__PURE__ */ React.createElement("button", { className: page === "book" ? "active" : "", onClick: () => setPage("book") }, "Book"), /* @__PURE__ */ React.createElement("button", { className: page === "prescriptions" ? "active" : "", onClick: () => setPage("prescriptions") }, "Prescriptions"), /* @__PURE__ */ React.createElement("button", { className: page === "home" ? "active" : "", onClick: () => setPage("home") }, "Profile")) : isNativeApp && isDoctor ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("button", { className: page === "consultations" ? "active" : "", onClick: () => setPage("consultations") }, "Consultations"), /* @__PURE__ */ React.createElement("button", { className: page === "prescriptions" ? "active" : "", onClick: () => setPage("prescriptions") }, "Prescriptions"), /* @__PURE__ */ React.createElement("button", { className: page === "home" ? "active" : "", onClick: () => setPage("home") }, "Profile")) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("button", { className: page === "home" ? "active" : "", onClick: () => setPage("home") }, "Home"), /* @__PURE__ */ React.createElement("button", { className: page === "consultations" ? "active" : "", onClick: () => setPage("consultations") }, "Consultations"), /* @__PURE__ */ React.createElement("button", { className: page === "detail" ? "active" : "", onClick: () => setPage("detail"), disabled: !selected }, "Detail"), !isAdmin ? /* @__PURE__ */ React.createElement("button", { className: page === "prescriptions" ? "active" : "", onClick: () => setPage("prescriptions") }, "Prescriptions") : null)), /* @__PURE__ */ React.createElement("main", { className: "layout" }, /* @__PURE__ */ React.createElement("section", { className: "stack left" }, !isLoggedIn && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("article", { className: "card" }, /* @__PURE__ */ React.createElement("div", { className: "card-head" }, /* @__PURE__ */ React.createElement("h2", null, "Authentication"), /* @__PURE__ */ React.createElement("p", null, "Login or register to continue.")), /* @__PURE__ */ React.createElement("div", { className: "segmented" }, /* @__PURE__ */ React.createElement("button", { className: authTab === "login" ? "active" : "", onClick: () => setAuthTab("login") }, "Login"), /* @__PURE__ */ React.createElement("button", { className: authTab === "register" ? "active" : "", onClick: () => setAuthTab("register") }, "Register")), authTab === "login" ? /* @__PURE__ */ React.createElement("form", { className: "form", onSubmit: loginSubmit }, /* @__PURE__ */ React.createElement("label", null, "Email ", /* @__PURE__ */ React.createElement("input", { type: "email", value: login.email, onChange: (e) => setLogin((p) => ({ ...p, email: e.target.value })), required: true })), /* @__PURE__ */ React.createElement("label", null, "Password ", /* @__PURE__ */ React.createElement("input", { type: "password", value: login.password, onChange: (e) => setLogin((p) => ({ ...p, password: e.target.value })), required: true })), /* @__PURE__ */ React.createElement("button", { className: "btn primary", type: "submit" }, "Login")) : /* @__PURE__ */ React.createElement("form", { className: "form", onSubmit: registerSubmit }, /* @__PURE__ */ React.createElement("label", null, "Name ", /* @__PURE__ */ React.createElement("input", { value: register.name, onChange: (e) => setRegister((p) => ({ ...p, name: e.target.value })), required: true })), /* @__PURE__ */ React.createElement("label", null, "Email ", /* @__PURE__ */ React.createElement("input", { type: "email", value: register.email, onChange: (e) => setRegister((p) => ({ ...p, email: e.target.value })), required: true })), /* @__PURE__ */ React.createElement("label", null, "Password ", /* @__PURE__ */ React.createElement("input", { type: "password", value: register.password, onChange: (e) => setRegister((p) => ({ ...p, password: e.target.value })), required: true })), /* @__PURE__ */ React.createElement("label", null, "Role", /* @__PURE__ */ React.createElement("select", { value: register.role, onChange: (e) => setRegister((p) => ({ ...p, role: e.target.value })) }, /* @__PURE__ */ React.createElement("option", { value: "PATIENT" }, "PATIENT"), /* @__PURE__ */ React.createElement("option", { value: "DOCTOR" }, "DOCTOR"))), register.role === "DOCTOR" && /* @__PURE__ */ React.createElement("label", null, "Specialization ", /* @__PURE__ */ React.createElement("input", { value: register.specialization, onChange: (e) => setRegister((p) => ({ ...p, specialization: e.target.value })) })), /* @__PURE__ */ React.createElement("button", { className: "btn primary", type: "submit" }, "Create Account")))), isLoggedIn && page === "home" && /* @__PURE__ */ React.createElement("article", { className: "card" }, /* @__PURE__ */ React.createElement("div", { className: "card-head" }, /* @__PURE__ */ React.createElement("h2", null, "Session"), /* @__PURE__ */ React.createElement("p", null, me.name, " (", me.email, ")")), /* @__PURE__ */ React.createElement("div", { className: "stats-grid mini" }, /* @__PURE__ */ React.createElement("div", { className: "stat" }, /* @__PURE__ */ React.createElement("span", null, "ID"), /* @__PURE__ */ React.createElement("strong", null, me.id || me._id)), /* @__PURE__ */ React.createElement("div", { className: "stat" }, /* @__PURE__ */ React.createElement("span", null, "Role"), /* @__PURE__ */ React.createElement("strong", null, me.role))), /* @__PURE__ */ React.createElement("button", { className: "btn ghost", onClick: logout }, "Logout")), isPatient && (isNativeApp ? page === "book" : page === "home") && /* @__PURE__ */ React.createElement("article", { className: "card" }, /* @__PURE__ */ React.createElement("div", { className: "card-head" }, /* @__PURE__ */ React.createElement("h2", null, "Book Consultation"), /* @__PURE__ */ React.createElement("p", null, "Create a new appointment request.")), /* @__PURE__ */ React.createElement("form", { className: "form", onSubmit: createConsultation }, /* @__PURE__ */ React.createElement("label", null, "Doctor", /* @__PURE__ */ React.createElement("select", { value: booking.doctorId, onChange: (e) => setBooking((p) => ({ ...p, doctorId: e.target.value })), required: true }, doctors.length === 0 ? /* @__PURE__ */ React.createElement("option", { value: "" }, "No approved doctors yet") : null, doctors.map((d) => /* @__PURE__ */ React.createElement("option", { key: d._id, value: d._id }, d.name, " (", d.specialization || "General", ")")))), /* @__PURE__ */ React.createElement("label", null, "Schedule (optional) ", /* @__PURE__ */ React.createElement("input", { type: "datetime-local", value: booking.scheduledAt, onChange: (e) => setBooking((p) => ({ ...p, scheduledAt: e.target.value })) })), /* @__PURE__ */ React.createElement("p", { className: "meta-line" }, "Consultation Fee: ", /* @__PURE__ */ React.createElement("strong", null, "INR ", selectedDoctorFee)), /* @__PURE__ */ React.createElement("button", { className: "btn primary", disabled: creating, type: "submit" }, creating ? "Creating..." : "Create Consultation"))), isAdmin && page === "home" && /* @__PURE__ */ React.createElement("article", { className: "card" }, /* @__PURE__ */ React.createElement("div", { className: "card-head" }, /* @__PURE__ */ React.createElement("h2", null, "Admin Control"), /* @__PURE__ */ React.createElement("p", null, "Platform overview and doctor approval.")), adminStats && /* @__PURE__ */ React.createElement("div", { className: "stats-grid" }, /* @__PURE__ */ React.createElement("div", { className: "stat" }, /* @__PURE__ */ React.createElement("span", null, "Users"), /* @__PURE__ */ React.createElement("strong", null, adminStats.usersTotal)), /* @__PURE__ */ React.createElement("div", { className: "stat" }, /* @__PURE__ */ React.createElement("span", null, "Doctors"), /* @__PURE__ */ React.createElement("strong", null, adminStats.doctorsTotal)), /* @__PURE__ */ React.createElement("div", { className: "stat" }, /* @__PURE__ */ React.createElement("span", null, "Pending"), /* @__PURE__ */ React.createElement("strong", null, adminStats.doctorsPending)), /* @__PURE__ */ React.createElement("div", { className: "stat" }, /* @__PURE__ */ React.createElement("span", null, "Patients"), /* @__PURE__ */ React.createElement("strong", null, adminStats.patientsTotal))), /* @__PURE__ */ React.createElement("div", { className: "list-head" }, /* @__PURE__ */ React.createElement("h3", null, "Pending Doctors"), /* @__PURE__ */ React.createElement("button", { className: "btn tiny", onClick: () => refreshAdmin().catch((e) => notify(e.message, true)) }, "Refresh")), /* @__PURE__ */ React.createElement("div", { className: "list" }, pendingDoctors.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "item" }, /* @__PURE__ */ React.createElement("div", { className: "meta" }, "No pending doctors.")) : pendingDoctors.map((d) => /* @__PURE__ */ React.createElement("div", { className: "item", key: d._id }, /* @__PURE__ */ React.createElement("div", { className: "title" }, d.name), /* @__PURE__ */ React.createElement("div", { className: "meta" }, d.email, " \u2022 ", d.specialization || "N/A"), /* @__PURE__ */ React.createElement("div", { className: "row" }, /* @__PURE__ */ React.createElement("button", { className: "btn tiny", onClick: () => approveDoctor(d._id) }, "Approve"))))), /* @__PURE__ */ React.createElement("div", { className: "list-head" }, /* @__PURE__ */ React.createElement("h3", null, "Doctor Fees")), /* @__PURE__ */ React.createElement("div", { className: "list" }, adminDoctors.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "item" }, /* @__PURE__ */ React.createElement("div", { className: "meta" }, "No doctors found.")) : adminDoctors.map((d) => /* @__PURE__ */ React.createElement(DoctorFeeRow, { key: d._id, doctor: d, onSave: setDoctorFee }))))), /* @__PURE__ */ React.createElement("section", { className: "stack right" }, isLoggedIn && page === "consultations" && /* @__PURE__ */ React.createElement("article", { className: "card" }, /* @__PURE__ */ React.createElement("div", { className: "list-head" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h2", null, "Consultations"), /* @__PURE__ */ React.createElement("p", null, "Pick one to open details.")), /* @__PURE__ */ React.createElement("button", { className: "btn tiny", onClick: () => refreshConsultations().catch((e) => notify(e.message, true)) }, "Refresh")), /* @__PURE__ */ React.createElement("div", { className: "list" }, consultations.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "item" }, /* @__PURE__ */ React.createElement("div", { className: "meta" }, "No consultations yet.")) : consultations.map((c) => {
+    return /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "bg-orb orb-a" }), /* @__PURE__ */ React.createElement("div", { className: "bg-orb orb-b" }), /* @__PURE__ */ React.createElement("div", { className: "bg-grid" }), /* @__PURE__ */ React.createElement("header", { className: "topbar" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "eyebrow" }, "Doctor + Patient AI Platform"), /* @__PURE__ */ React.createElement("h1", null, "MediFlow Console")), /* @__PURE__ */ React.createElement("div", { className: "status-wrap" }, /* @__PURE__ */ React.createElement("span", { className: `pill ${isLoggedIn ? "good" : "neutral"}` }, apiStatus))), isLoggedIn && /* @__PURE__ */ React.createElement("div", { className: "segmented app-nav" }, isNativeApp && isPatient ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("button", { className: page === "consultations" ? "active" : "", onClick: () => setPage("consultations") }, "Consultations"), /* @__PURE__ */ React.createElement("button", { className: page === "book" ? "active" : "", onClick: () => setPage("book") }, "Book"), /* @__PURE__ */ React.createElement("button", { className: page === "prescriptions" ? "active" : "", onClick: () => setPage("prescriptions") }, "Prescriptions"), /* @__PURE__ */ React.createElement("button", { className: page === "home" ? "active" : "", onClick: () => setPage("home") }, "Profile")) : isNativeApp && isDoctor ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("button", { className: page === "consultations" ? "active" : "", onClick: () => setPage("consultations") }, "Consultations"), /* @__PURE__ */ React.createElement("button", { className: page === "prescriptions" ? "active" : "", onClick: () => setPage("prescriptions") }, "Prescriptions"), /* @__PURE__ */ React.createElement("button", { className: page === "home" ? "active" : "", onClick: () => setPage("home") }, "Profile")) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("button", { className: page === "home" ? "active" : "", onClick: () => setPage("home") }, "Home"), /* @__PURE__ */ React.createElement("button", { className: page === "consultations" ? "active" : "", onClick: () => setPage("consultations") }, "Consultations"), /* @__PURE__ */ React.createElement("button", { className: page === "detail" ? "active" : "", onClick: () => setPage("detail"), disabled: !selected }, "Detail"), !isAdmin ? /* @__PURE__ */ React.createElement("button", { className: page === "prescriptions" ? "active" : "", onClick: () => setPage("prescriptions") }, "Prescriptions") : null)), /* @__PURE__ */ React.createElement("main", { className: "layout" }, /* @__PURE__ */ React.createElement("section", { className: "stack left" }, isRestoringSession && /* @__PURE__ */ React.createElement("article", { className: "card" }, /* @__PURE__ */ React.createElement("div", { className: "card-head" }, /* @__PURE__ */ React.createElement("h2", null, "Restoring session"), /* @__PURE__ */ React.createElement("p", null, "Checking your login\u2026")), /* @__PURE__ */ React.createElement("button", { className: "btn ghost", onClick: logout }, "Logout")), !isLoggedIn && !isRestoringSession && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("article", { className: "card" }, /* @__PURE__ */ React.createElement("div", { className: "card-head" }, /* @__PURE__ */ React.createElement("h2", null, "Authentication"), /* @__PURE__ */ React.createElement("p", null, "Login or register to continue.")), /* @__PURE__ */ React.createElement("div", { className: "segmented" }, /* @__PURE__ */ React.createElement("button", { className: authTab === "login" ? "active" : "", onClick: () => setAuthTab("login") }, "Login"), /* @__PURE__ */ React.createElement("button", { className: authTab === "register" ? "active" : "", onClick: () => setAuthTab("register") }, "Register")), authTab === "login" ? /* @__PURE__ */ React.createElement("form", { className: "form", onSubmit: loginSubmit }, /* @__PURE__ */ React.createElement("label", null, "Email ", /* @__PURE__ */ React.createElement("input", { type: "email", value: login.email, onChange: (e) => setLogin((p) => ({ ...p, email: e.target.value })), required: true })), /* @__PURE__ */ React.createElement("label", null, "Password ", /* @__PURE__ */ React.createElement("input", { type: "password", value: login.password, onChange: (e) => setLogin((p) => ({ ...p, password: e.target.value })), required: true })), /* @__PURE__ */ React.createElement("button", { className: "btn primary", type: "submit" }, "Login")) : /* @__PURE__ */ React.createElement("form", { className: "form", onSubmit: registerSubmit }, /* @__PURE__ */ React.createElement("label", null, "Name ", /* @__PURE__ */ React.createElement("input", { value: register.name, onChange: (e) => setRegister((p) => ({ ...p, name: e.target.value })), required: true })), /* @__PURE__ */ React.createElement("label", null, "Email ", /* @__PURE__ */ React.createElement("input", { type: "email", value: register.email, onChange: (e) => setRegister((p) => ({ ...p, email: e.target.value })), required: true })), /* @__PURE__ */ React.createElement("label", null, "Password ", /* @__PURE__ */ React.createElement("input", { type: "password", value: register.password, onChange: (e) => setRegister((p) => ({ ...p, password: e.target.value })), required: true })), /* @__PURE__ */ React.createElement("label", null, "Role", /* @__PURE__ */ React.createElement("select", { value: register.role, onChange: (e) => setRegister((p) => ({ ...p, role: e.target.value })) }, /* @__PURE__ */ React.createElement("option", { value: "PATIENT" }, "PATIENT"), /* @__PURE__ */ React.createElement("option", { value: "DOCTOR" }, "DOCTOR"))), register.role === "DOCTOR" && /* @__PURE__ */ React.createElement("label", null, "Specialization ", /* @__PURE__ */ React.createElement("input", { value: register.specialization, onChange: (e) => setRegister((p) => ({ ...p, specialization: e.target.value })) })), /* @__PURE__ */ React.createElement("button", { className: "btn primary", type: "submit" }, "Create Account")))), isLoggedIn && page === "home" && /* @__PURE__ */ React.createElement("article", { className: "card" }, /* @__PURE__ */ React.createElement("div", { className: "card-head" }, /* @__PURE__ */ React.createElement("h2", null, "Session"), /* @__PURE__ */ React.createElement("p", null, me.name, " (", me.email, ")")), /* @__PURE__ */ React.createElement("div", { className: "stats-grid mini" }, /* @__PURE__ */ React.createElement("div", { className: "stat" }, /* @__PURE__ */ React.createElement("span", null, "ID"), /* @__PURE__ */ React.createElement("strong", null, me.id || me._id)), /* @__PURE__ */ React.createElement("div", { className: "stat" }, /* @__PURE__ */ React.createElement("span", null, "Role"), /* @__PURE__ */ React.createElement("strong", null, me.role))), /* @__PURE__ */ React.createElement("button", { className: "btn ghost", onClick: logout }, "Logout")), isPatient && (isNativeApp ? page === "book" : page === "home") && /* @__PURE__ */ React.createElement("article", { className: "card" }, /* @__PURE__ */ React.createElement("div", { className: "card-head" }, /* @__PURE__ */ React.createElement("h2", null, "Book Consultation"), /* @__PURE__ */ React.createElement("p", null, "Create a new appointment request.")), /* @__PURE__ */ React.createElement("form", { className: "form", onSubmit: createConsultation }, /* @__PURE__ */ React.createElement("label", null, "Doctor", /* @__PURE__ */ React.createElement("select", { value: booking.doctorId, onChange: (e) => setBooking((p) => ({ ...p, doctorId: e.target.value })), required: true }, doctors.length === 0 ? /* @__PURE__ */ React.createElement("option", { value: "" }, "No approved doctors yet") : null, doctors.map((d) => /* @__PURE__ */ React.createElement("option", { key: d._id, value: d._id }, d.name, " (", d.specialization || "General", ")")))), /* @__PURE__ */ React.createElement("label", null, "Schedule (optional) ", /* @__PURE__ */ React.createElement("input", { type: "datetime-local", value: booking.scheduledAt, onChange: (e) => setBooking((p) => ({ ...p, scheduledAt: e.target.value })) })), /* @__PURE__ */ React.createElement("p", { className: "meta-line" }, "Consultation Fee: ", /* @__PURE__ */ React.createElement("strong", null, "INR ", selectedDoctorFee)), /* @__PURE__ */ React.createElement("button", { className: "btn primary", disabled: creating, type: "submit" }, creating ? "Creating..." : "Create Consultation"))), isAdmin && page === "home" && /* @__PURE__ */ React.createElement("article", { className: "card" }, /* @__PURE__ */ React.createElement("div", { className: "card-head" }, /* @__PURE__ */ React.createElement("h2", null, "Admin Control"), /* @__PURE__ */ React.createElement("p", null, "Platform overview and doctor approval.")), adminStats && /* @__PURE__ */ React.createElement("div", { className: "stats-grid" }, /* @__PURE__ */ React.createElement("div", { className: "stat" }, /* @__PURE__ */ React.createElement("span", null, "Users"), /* @__PURE__ */ React.createElement("strong", null, adminStats.usersTotal)), /* @__PURE__ */ React.createElement("div", { className: "stat" }, /* @__PURE__ */ React.createElement("span", null, "Doctors"), /* @__PURE__ */ React.createElement("strong", null, adminStats.doctorsTotal)), /* @__PURE__ */ React.createElement("div", { className: "stat" }, /* @__PURE__ */ React.createElement("span", null, "Pending"), /* @__PURE__ */ React.createElement("strong", null, adminStats.doctorsPending)), /* @__PURE__ */ React.createElement("div", { className: "stat" }, /* @__PURE__ */ React.createElement("span", null, "Patients"), /* @__PURE__ */ React.createElement("strong", null, adminStats.patientsTotal))), /* @__PURE__ */ React.createElement("div", { className: "list-head" }, /* @__PURE__ */ React.createElement("h3", null, "Pending Doctors"), /* @__PURE__ */ React.createElement("button", { className: "btn tiny", onClick: () => refreshAdmin().catch((e) => notify(e.message, true)) }, "Refresh")), /* @__PURE__ */ React.createElement("div", { className: "list" }, pendingDoctors.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "item" }, /* @__PURE__ */ React.createElement("div", { className: "meta" }, "No pending doctors.")) : pendingDoctors.map((d) => /* @__PURE__ */ React.createElement("div", { className: "item", key: d._id }, /* @__PURE__ */ React.createElement("div", { className: "title" }, d.name), /* @__PURE__ */ React.createElement("div", { className: "meta" }, d.email, " \u2022 ", d.specialization || "N/A"), /* @__PURE__ */ React.createElement("div", { className: "row" }, /* @__PURE__ */ React.createElement("button", { className: "btn tiny", onClick: () => approveDoctor(d._id) }, "Approve"))))), /* @__PURE__ */ React.createElement("div", { className: "list-head" }, /* @__PURE__ */ React.createElement("h3", null, "Doctor Fees")), /* @__PURE__ */ React.createElement("div", { className: "list" }, adminDoctors.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "item" }, /* @__PURE__ */ React.createElement("div", { className: "meta" }, "No doctors found.")) : adminDoctors.map((d) => /* @__PURE__ */ React.createElement(DoctorFeeRow, { key: d._id, doctor: d, onSave: setDoctorFee }))))), /* @__PURE__ */ React.createElement("section", { className: "stack right" }, isLoggedIn && page === "consultations" && /* @__PURE__ */ React.createElement("article", { className: "card" }, /* @__PURE__ */ React.createElement("div", { className: "list-head" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h2", null, "Consultations"), /* @__PURE__ */ React.createElement("p", null, "Pick one to open details.")), /* @__PURE__ */ React.createElement("button", { className: "btn tiny", onClick: () => refreshConsultations().catch((e) => notify(e.message, true)) }, "Refresh")), /* @__PURE__ */ React.createElement("div", { className: "list" }, consultations.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "item" }, /* @__PURE__ */ React.createElement("div", { className: "meta" }, "No consultations yet.")) : consultations.map((c) => {
       const locked = isPatient && c.status !== "IN_PROGRESS";
       return /* @__PURE__ */ React.createElement("div", { className: "item", key: c._id }, /* @__PURE__ */ React.createElement("div", { className: "title" }, c.status, " \u2022 ", c.paymentStatus), /* @__PURE__ */ React.createElement("div", { className: "meta" }, "ID: ", c._id), /* @__PURE__ */ React.createElement("div", { className: "meta" }, "Doctor: ", personLabel(c.doctorId), " | Patient: ", personLabel(c.patientId)), /* @__PURE__ */ React.createElement("div", { className: "meta" }, "When: ", c.scheduledAt ? new Date(c.scheduledAt).toLocaleString() : "Not scheduled"), locked ? /* @__PURE__ */ React.createElement("div", { className: "meta" }, "Waiting for doctor approval. Open unlocks after approval.") : null, isPatient && locked && isNativeApp ? null : /* @__PURE__ */ React.createElement("div", { className: "row" }, /* @__PURE__ */ React.createElement("button", { className: "btn tiny", disabled: locked, onClick: () => openConsultation(c._id) }, "Open")));
-    }))), isLoggedIn && page === "detail" && !selected && /* @__PURE__ */ React.createElement("article", { className: "card" }, /* @__PURE__ */ React.createElement("div", { className: "item" }, /* @__PURE__ */ React.createElement("div", { className: "meta" }, "Select a consultation first from the Consultations page."))), isLoggedIn && page === "detail" && selected && /* @__PURE__ */ React.createElement("article", { className: "card" }, /* @__PURE__ */ React.createElement("div", { className: "list-head" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h2", null, "Consultation Detail"), /* @__PURE__ */ React.createElement("p", null, "Status: ", selected.status, " | Payment: ", selected.paymentStatus, " | ID: ", selected._id))), isNativeApp && /* @__PURE__ */ React.createElement("div", { className: "segmented detail-nav" }, !patientLockedByPayment ? /* @__PURE__ */ React.createElement("button", { className: detailTab === "chat" ? "active" : "", onClick: () => setDetailTab("chat") }, "Chat") : null, /* @__PURE__ */ React.createElement("button", { className: detailTab === "actions" ? "active" : "", onClick: () => setDetailTab("actions") }, "Actions"), !patientLockedByPayment ? /* @__PURE__ */ React.createElement("button", { className: detailTab === "call" ? "active" : "", onClick: () => setDetailTab("call") }, "Call") : null, /* @__PURE__ */ React.createElement("button", { className: detailTab === "ai" ? "active" : "", onClick: () => setDetailTab("ai") }, "AI"), /* @__PURE__ */ React.createElement("button", { className: detailTab === "prescription" ? "active" : "", onClick: () => setDetailTab("prescription") }, "Prescription")), /* @__PURE__ */ React.createElement("div", { className: "detail-grid" }, !patientLockedByPayment && (!isNativeApp || detailTab === "chat") && /* @__PURE__ */ React.createElement("section", { className: "pane" }, /* @__PURE__ */ React.createElement("h3", null, "Chat"), /* @__PURE__ */ React.createElement("div", { className: "chat" }, (selected.chat || []).length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "item" }, /* @__PURE__ */ React.createElement("div", { className: "meta" }, "No messages yet.")) : selected.chat.map((m, i) => /* @__PURE__ */ React.createElement("div", { className: "chat-msg", key: `${m.createdAt}-${i}` }, /* @__PURE__ */ React.createElement("b", null, m.senderRole), /* @__PURE__ */ React.createElement("p", null, m.message), /* @__PURE__ */ React.createElement("span", null, new Date(m.createdAt).toLocaleString())))), /* @__PURE__ */ React.createElement("form", { className: "inline-form", onSubmit: postMessage }, /* @__PURE__ */ React.createElement("input", { value: chatMessage, onChange: (e) => setChatMessage(e.target.value), placeholder: "Type your message", required: true }), /* @__PURE__ */ React.createElement("button", { className: "btn primary", type: "submit" }, "Send"))), (!isNativeApp || detailTab === "actions") && /* @__PURE__ */ React.createElement("section", { className: "pane" }, /* @__PURE__ */ React.createElement("h3", null, "Actions"), isPatient && /* @__PURE__ */ React.createElement("div", { className: "actions" }, /* @__PURE__ */ React.createElement("button", { className: "btn", disabled: !flags.inProgress, onClick: () => doAction(`/api/consultations/${selected._id}/payment/mock/create-order`, "Order created") }, "Create Payment Order"), /* @__PURE__ */ React.createElement("button", { className: "btn", disabled: !flags.inProgress, onClick: () => doAction(`/api/consultations/${selected._id}/payment/mock/verify`, "Payment verified") }, "Verify Mock Payment"), /* @__PURE__ */ React.createElement("form", { className: "inline-form", onSubmit: uploadReport }, /* @__PURE__ */ React.createElement("input", { name: "file", type: "file", required: true }), /* @__PURE__ */ React.createElement("button", { className: "btn", type: "submit" }, "Upload Report"))), (isDoctor || isAdmin) && /* @__PURE__ */ React.createElement("div", { className: "actions" }, /* @__PURE__ */ React.createElement("button", { className: "btn", onClick: () => doAction(`/api/consultations/${selected._id}/ai/summary`, "AI summary generated") }, "Generate AI Summary"), /* @__PURE__ */ React.createElement("button", { className: "btn", onClick: () => doAction(`/api/consultations/${selected._id}/ai/suggestions`, "AI suggestions generated") }, "Generate AI Suggestions")), isDoctor && /* @__PURE__ */ React.createElement("div", { className: "actions" }, /* @__PURE__ */ React.createElement("button", { className: "btn", disabled: !flags.schedOrReq, onClick: () => doAction(`/api/consultations/${selected._id}/doctor/approve`, "Consultation approved") }, "Approve Consultation"), /* @__PURE__ */ React.createElement("button", { className: "btn accent", disabled: !flags.inProgress || !flags.paid, onClick: () => doAction(`/api/consultations/${selected._id}/ai/prescription`, "Prescription generated") }, "Generate Prescription"), /* @__PURE__ */ React.createElement("button", { className: "btn ghost", onClick: markDoneDelete }, "Mark Done And Delete")), /* @__PURE__ */ React.createElement("h4", null, "Reports"), /* @__PURE__ */ React.createElement("div", { className: "list compact" }, (selected.reports || []).length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "item" }, /* @__PURE__ */ React.createElement("div", { className: "meta" }, "No reports uploaded.")) : selected.reports.map((r, i) => /* @__PURE__ */ React.createElement("div", { className: "item", key: `${r.path}-${i}` }, /* @__PURE__ */ React.createElement("div", { className: "title" }, r.originalName), /* @__PURE__ */ React.createElement("div", { className: "meta" }, r.mimeType, " \u2022 ", Math.round((r.size || 0) / 1024), " KB"), /* @__PURE__ */ React.createElement("div", { className: "row" }, /* @__PURE__ */ React.createElement("a", { className: "btn tiny", target: "_blank", rel: "noreferrer", href: r.path.startsWith("/") ? r.path : `/${r.path}` }, "Open file")))))), !patientLockedByPayment && (!isNativeApp || detailTab === "call") ? /* @__PURE__ */ React.createElement(CallPane, { call, canUseCall, notify }) : null, (!isNativeApp || detailTab === "ai") && /* @__PURE__ */ React.createElement("section", { className: "pane full" }, /* @__PURE__ */ React.createElement("h3", null, "AI Output"), /* @__PURE__ */ React.createElement("div", { className: "text-output" }, /* @__PURE__ */ React.createElement("label", null, "Summary"), /* @__PURE__ */ React.createElement("textarea", { readOnly: true, value: ((_f = selected.ai) == null ? void 0 : _f.summary) || "No AI summary generated yet." })), /* @__PURE__ */ React.createElement("div", { className: "text-output" }, /* @__PURE__ */ React.createElement("label", null, "Suggestions"), /* @__PURE__ */ React.createElement("textarea", { readOnly: true, value: ((_g = selected.ai) == null ? void 0 : _g.suggestions) || "No AI suggestions generated yet." }))), (!isNativeApp || detailTab === "prescription") && /* @__PURE__ */ React.createElement("section", { className: "pane full" }, /* @__PURE__ */ React.createElement("h3", null, "Prescription"), isDoctor && /* @__PURE__ */ React.createElement("form", { className: "form", onSubmit: saveManualPrescription }, /* @__PURE__ */ React.createElement("label", null, "Write Prescription", /* @__PURE__ */ React.createElement("textarea", { value: manualPrescription, onChange: (e) => setManualPrescription(e.target.value), placeholder: "Write prescription details...", required: true })), /* @__PURE__ */ React.createElement("button", { className: "btn primary", disabled: !flags.inProgress || !flags.paid, type: "submit" }, "Save Prescription")), /* @__PURE__ */ React.createElement("div", { className: "list" }, selectedPrescriptionList.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "item" }, /* @__PURE__ */ React.createElement("div", { className: "meta" }, "No prescription saved for this consultation yet.")) : selectedPrescriptionList.map((p) => /* @__PURE__ */ React.createElement("div", { className: "item", key: p._id }, /* @__PURE__ */ React.createElement("div", { className: "meta" }, "Created: ", new Date(p.createdAt).toLocaleString()), /* @__PURE__ */ React.createElement("pre", null, p.text))))))), isLoggedIn && !isAdmin && page === "prescriptions" && /* @__PURE__ */ React.createElement("article", { className: "card" }, /* @__PURE__ */ React.createElement("div", { className: "list-head" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h2", null, "Prescriptions"), /* @__PURE__ */ React.createElement("p", null, "Issued or received prescriptions.")), /* @__PURE__ */ React.createElement("button", { className: "btn tiny", onClick: () => refreshPrescriptions().catch((e) => notify(e.message, true)) }, "Refresh")), /* @__PURE__ */ React.createElement("div", { className: "list" }, prescriptions.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "item" }, /* @__PURE__ */ React.createElement("div", { className: "meta" }, "No prescriptions yet.")) : prescriptions.map((p) => /* @__PURE__ */ React.createElement("div", { className: "item", key: p._id }, /* @__PURE__ */ React.createElement("div", { className: "title" }, "Consultation: ", String(p.consultationId)), /* @__PURE__ */ React.createElement("div", { className: "meta" }, "Created: ", new Date(p.createdAt).toLocaleString()), /* @__PURE__ */ React.createElement("pre", null, p.text))))))), toast.show && /* @__PURE__ */ React.createElement("aside", { className: `toast ${toast.bad ? "bad" : "good"}` }, toast.message), modal.show && /* @__PURE__ */ React.createElement("div", { className: "modal-backdrop", onClick: (e) => e.target.className === "modal-backdrop" && setModal((m) => ({ ...m, show: false })) }, /* @__PURE__ */ React.createElement("div", { className: "modal-card" }, /* @__PURE__ */ React.createElement("h3", null, modal.title), /* @__PURE__ */ React.createElement("p", null, modal.message), /* @__PURE__ */ React.createElement("button", { className: "btn primary", onClick: () => setModal((m) => ({ ...m, show: false })) }, "OK"))));
+    }))), isLoggedIn && page === "detail" && !selected && /* @__PURE__ */ React.createElement("article", { className: "card" }, /* @__PURE__ */ React.createElement("div", { className: "item" }, /* @__PURE__ */ React.createElement("div", { className: "meta" }, "Select a consultation first from the Consultations page."))), isLoggedIn && page === "detail" && selected && /* @__PURE__ */ React.createElement("article", { className: "card" }, /* @__PURE__ */ React.createElement("div", { className: "list-head" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h2", null, "Consultation Detail"), /* @__PURE__ */ React.createElement("p", null, "Status: ", selected.status, " | Payment: ", selected.paymentStatus, " | ID: ", selected._id))), isNativeApp && /* @__PURE__ */ React.createElement("div", { className: "segmented detail-nav" }, !patientLockedByPayment ? /* @__PURE__ */ React.createElement("button", { className: detailTab === "chat" ? "active" : "", onClick: () => setDetailTab("chat") }, "Chat") : null, /* @__PURE__ */ React.createElement("button", { className: detailTab === "actions" ? "active" : "", onClick: () => setDetailTab("actions") }, "Actions"), !patientLockedByPayment ? /* @__PURE__ */ React.createElement("button", { className: detailTab === "call" ? "active" : "", onClick: () => setDetailTab("call") }, "Call") : null, /* @__PURE__ */ React.createElement("button", { className: detailTab === "ai" ? "active" : "", onClick: () => setDetailTab("ai") }, "AI"), /* @__PURE__ */ React.createElement("button", { className: detailTab === "prescription" ? "active" : "", onClick: () => setDetailTab("prescription") }, "Prescription")), /* @__PURE__ */ React.createElement("div", { className: "detail-grid" }, !patientLockedByPayment && (!isNativeApp || detailTab === "chat") && /* @__PURE__ */ React.createElement("section", { className: "pane" }, /* @__PURE__ */ React.createElement("h3", null, "Chat"), /* @__PURE__ */ React.createElement("div", { className: "chat" }, (selected.chat || []).length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "item" }, /* @__PURE__ */ React.createElement("div", { className: "meta" }, "No messages yet.")) : selected.chat.map((m, i) => /* @__PURE__ */ React.createElement("div", { className: "chat-msg", key: `${m.createdAt}-${i}` }, /* @__PURE__ */ React.createElement("b", null, m.senderRole), /* @__PURE__ */ React.createElement("p", null, m.message), /* @__PURE__ */ React.createElement("span", null, new Date(m.createdAt).toLocaleString())))), /* @__PURE__ */ React.createElement("form", { className: "inline-form", onSubmit: postMessage }, /* @__PURE__ */ React.createElement("input", { value: chatMessage, onChange: (e) => setChatMessage(e.target.value), placeholder: "Type your message", required: true }), /* @__PURE__ */ React.createElement("button", { className: "btn primary", type: "submit" }, "Send"))), (!isNativeApp || detailTab === "actions") && /* @__PURE__ */ React.createElement("section", { className: "pane" }, /* @__PURE__ */ React.createElement("h3", null, "Actions"), isPatient && /* @__PURE__ */ React.createElement("div", { className: "actions" }, /* @__PURE__ */ React.createElement("button", { className: "btn", disabled: !flags.inProgress, onClick: () => doAction(`/api/consultations/${selected._id}/payment/mock/create-order`, "Order created") }, "Create Payment Order"), /* @__PURE__ */ React.createElement("button", { className: "btn", disabled: !flags.inProgress, onClick: () => doAction(`/api/consultations/${selected._id}/payment/mock/verify`, "Payment verified") }, "Verify Mock Payment"), /* @__PURE__ */ React.createElement("form", { className: "inline-form", onSubmit: uploadReport }, /* @__PURE__ */ React.createElement("input", { name: "file", type: "file", required: true }), /* @__PURE__ */ React.createElement("button", { className: "btn", type: "submit" }, "Upload Report"))), (isDoctor || isAdmin) && /* @__PURE__ */ React.createElement("div", { className: "actions" }, /* @__PURE__ */ React.createElement("button", { className: "btn", onClick: () => doAction(`/api/consultations/${selected._id}/ai/summary`, "AI summary generated") }, "Generate AI Summary"), /* @__PURE__ */ React.createElement("button", { className: "btn", onClick: () => doAction(`/api/consultations/${selected._id}/ai/suggestions`, "AI suggestions generated") }, "Generate AI Suggestions")), isDoctor && /* @__PURE__ */ React.createElement("div", { className: "actions" }, /* @__PURE__ */ React.createElement("button", { className: "btn", disabled: !flags.schedOrReq, onClick: () => doAction(`/api/consultations/${selected._id}/doctor/approve`, "Consultation approved") }, "Approve Consultation"), /* @__PURE__ */ React.createElement("button", { className: "btn accent", disabled: !flags.inProgress || !flags.paid, onClick: () => doAction(`/api/consultations/${selected._id}/ai/prescription`, "Prescription generated") }, "Generate Prescription"), /* @__PURE__ */ React.createElement("button", { className: "btn ghost", onClick: markDoneDelete }, "Mark Done And Delete")), /* @__PURE__ */ React.createElement("h4", null, "Reports"), /* @__PURE__ */ React.createElement("div", { className: "list compact" }, (selected.reports || []).length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "item" }, /* @__PURE__ */ React.createElement("div", { className: "meta" }, "No reports uploaded.")) : selected.reports.map((r, i) => /* @__PURE__ */ React.createElement("div", { className: "item", key: `${r.path}-${i}` }, /* @__PURE__ */ React.createElement("div", { className: "title" }, r.originalName), /* @__PURE__ */ React.createElement("div", { className: "meta" }, r.mimeType, " \u2022 ", Math.round((r.size || 0) / 1024), " KB"), /* @__PURE__ */ React.createElement("div", { className: "row" }, /* @__PURE__ */ React.createElement("a", { className: "btn tiny", target: "_blank", rel: "noreferrer", href: r.path.startsWith("/") ? r.path : `/${r.path}` }, "Open file")))))), !patientLockedByPayment && (!isNativeApp || detailTab === "call") ? /* @__PURE__ */ React.createElement(CallPane, { call, canUseCall, notify, isNativeApp, me, selected }) : null, (!isNativeApp || detailTab === "ai") && /* @__PURE__ */ React.createElement("section", { className: "pane full" }, /* @__PURE__ */ React.createElement("h3", null, "AI Output"), /* @__PURE__ */ React.createElement("div", { className: "text-output" }, /* @__PURE__ */ React.createElement("label", null, "Summary"), /* @__PURE__ */ React.createElement("textarea", { readOnly: true, value: ((_h = selected.ai) == null ? void 0 : _h.summary) || "No AI summary generated yet." })), /* @__PURE__ */ React.createElement("div", { className: "text-output" }, /* @__PURE__ */ React.createElement("label", null, "Suggestions"), /* @__PURE__ */ React.createElement("textarea", { readOnly: true, value: ((_i = selected.ai) == null ? void 0 : _i.suggestions) || "No AI suggestions generated yet." }))), (!isNativeApp || detailTab === "prescription") && /* @__PURE__ */ React.createElement("section", { className: "pane full" }, /* @__PURE__ */ React.createElement("h3", null, "Prescription"), isDoctor && /* @__PURE__ */ React.createElement("form", { className: "form", onSubmit: saveManualPrescription }, /* @__PURE__ */ React.createElement("label", null, "Write Prescription", /* @__PURE__ */ React.createElement("textarea", { value: manualPrescription, onChange: (e) => setManualPrescription(e.target.value), placeholder: "Write prescription details...", required: true })), /* @__PURE__ */ React.createElement("button", { className: "btn primary", disabled: !flags.inProgress || !flags.paid, type: "submit" }, "Save Prescription")), /* @__PURE__ */ React.createElement("div", { className: "list" }, selectedPrescriptionList.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "item" }, /* @__PURE__ */ React.createElement("div", { className: "meta" }, "No prescription saved for this consultation yet.")) : selectedPrescriptionList.map((p) => /* @__PURE__ */ React.createElement("div", { className: "item", key: p._id }, /* @__PURE__ */ React.createElement("div", { className: "meta" }, "Created: ", new Date(p.createdAt).toLocaleString()), /* @__PURE__ */ React.createElement("pre", null, p.text))))))), isLoggedIn && !isAdmin && page === "prescriptions" && /* @__PURE__ */ React.createElement("article", { className: "card" }, /* @__PURE__ */ React.createElement("div", { className: "list-head" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h2", null, "Prescriptions"), /* @__PURE__ */ React.createElement("p", null, "Issued or received prescriptions.")), /* @__PURE__ */ React.createElement("button", { className: "btn tiny", onClick: () => refreshPrescriptions().catch((e) => notify(e.message, true)) }, "Refresh")), /* @__PURE__ */ React.createElement("div", { className: "list" }, prescriptions.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "item" }, /* @__PURE__ */ React.createElement("div", { className: "meta" }, "No prescriptions yet.")) : prescriptions.map((p) => /* @__PURE__ */ React.createElement("div", { className: "item", key: p._id }, /* @__PURE__ */ React.createElement("div", { className: "title" }, "Consultation: ", String(p.consultationId)), /* @__PURE__ */ React.createElement("div", { className: "meta" }, "Created: ", new Date(p.createdAt).toLocaleString()), /* @__PURE__ */ React.createElement("pre", null, p.text))))))), toast.show && /* @__PURE__ */ React.createElement("aside", { className: `toast ${toast.bad ? "bad" : "good"}` }, toast.message), modal.show && /* @__PURE__ */ React.createElement("div", { className: "modal-backdrop", onClick: (e) => e.target.className === "modal-backdrop" && setModal((m) => ({ ...m, show: false })) }, /* @__PURE__ */ React.createElement("div", { className: "modal-card" }, /* @__PURE__ */ React.createElement("h3", null, modal.title), /* @__PURE__ */ React.createElement("p", null, modal.message), /* @__PURE__ */ React.createElement("button", { className: "btn primary", onClick: () => setModal((m) => ({ ...m, show: false })) }, "OK"))));
   }
   function DoctorFeeRow({ doctor, onSave }) {
     const [fee, setFee] = useState2(doctor.consultationFee || 499);
