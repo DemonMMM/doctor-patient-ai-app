@@ -2,8 +2,82 @@ import { useCallEngine } from './call-engine.js';
 import { CallPane } from './call-pane.jsx';
 const { useEffect, useMemo, useRef, useState } = React;
 const DEFAULT_API_BASE = 'https://doctor-patient-ai-app.onrender.com';
+
+function isNativeRuntime() {
+  try {
+    return Boolean(window.Capacitor && (window.Capacitor.isNativePlatform?.() ?? true));
+  } catch {
+    return false;
+  }
+}
+
+function showStartupOverlay(message, detail) {
+  if (!isNativeRuntime()) return;
+  try {
+    const existing = document.getElementById('startup-debug-overlay');
+    if (existing) existing.remove();
+
+    const el = document.createElement('div');
+    el.id = 'startup-debug-overlay';
+    el.style.position = 'fixed';
+    el.style.inset = '0';
+    el.style.zIndex = '99999';
+    el.style.background = 'rgba(10, 18, 18, 0.92)';
+    el.style.color = '#eaf3f3';
+    el.style.padding = '16px';
+    el.style.fontFamily = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+    el.style.overflow = 'auto';
+    el.innerHTML = `
+      <div style="max-width: 900px; margin: 0 auto;">
+        <div style="font-weight: 800; font-size: 14px; letter-spacing: 0.06em; text-transform: uppercase; margin-bottom: 10px;">MediFlow Startup Error</div>
+        <div style="font-size: 14px; line-height: 1.35; white-space: pre-wrap;">${String(message || 'Unknown error')}</div>
+        ${detail ? `<pre style="margin-top: 12px; padding: 12px; background: rgba(255,255,255,0.06); border-radius: 10px; white-space: pre-wrap; overflow-wrap: anywhere;">${String(detail)}</pre>` : ''}
+        <div style="margin-top: 12px; opacity: 0.9; font-size: 12px; line-height: 1.35;">Send me a screenshot of this screen.</div>
+      </div>
+    `;
+    document.body.appendChild(el);
+  } catch {
+    // If even the overlay fails, we can't surface the error.
+  }
+}
+
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+  componentDidCatch(error) {
+    showStartupOverlay('React render crashed', error?.stack || String(error));
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{ padding: 16 }}>
+          <h2>App failed to load</h2>
+          <p className="meta-line">A startup error occurred. Please share a screenshot.</p>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+if (isNativeRuntime()) {
+  window.addEventListener('error', (e) => {
+    const err = e?.error;
+    showStartupOverlay(e?.message || 'Unhandled error', err?.stack || String(err || ''));
+  });
+  window.addEventListener('unhandledrejection', (e) => {
+    const reason = e?.reason;
+    showStartupOverlay('Unhandled promise rejection', reason?.stack || String(reason || ''));
+  });
+}
+
 function App() {
-  const isNativeApp = Boolean(window.Capacitor && (window.Capacitor.isNativePlatform?.() ?? true));
+  const isNativeApp = isNativeRuntime();
   const [token, setToken] = useState(localStorage.getItem('token') || '');
   const apiBase = DEFAULT_API_BASE;
   const [me, setMe] = useState(null);
@@ -222,21 +296,6 @@ function App() {
       window.clearInterval(t);
     };
   }, [isNativeApp]);
-
-  useEffect(() => {
-    if (!isNativeApp) return;
-    const plugin = nativeNotificationPlugin;
-    if (!plugin?.removeAllDeliveredNotifications) return;
-    if (call.incomingCall) return;
-    void plugin.removeAllDeliveredNotifications().catch(() => {});
-  }, [isNativeApp, call.incomingCall]);
-
-  useEffect(() => {
-    if (!isNativeApp) return;
-    if (!nativeCallNotifications?.clearIncomingCall) return;
-    if (call.incomingCall) return;
-    void nativeCallNotifications.clearIncomingCall().catch(() => {});
-  }, [isNativeApp, call.incomingCall]);
   function notify(message, bad = false) {
     setToast({ show: true, message, bad });
     window.clearTimeout(notify.t);
@@ -300,6 +359,21 @@ function App() {
   useEffect(() => {
     callRef.current = call;
   }, [call]);
+
+  useEffect(() => {
+    if (!isNativeApp) return;
+    const plugin = nativeNotificationPlugin;
+    if (!plugin?.removeAllDeliveredNotifications) return;
+    if (call.incomingCall) return;
+    void plugin.removeAllDeliveredNotifications().catch(() => {});
+  }, [isNativeApp, call.incomingCall]);
+
+  useEffect(() => {
+    if (!isNativeApp) return;
+    if (!nativeCallNotifications?.clearIncomingCall) return;
+    if (call.incomingCall) return;
+    void nativeCallNotifications.clearIncomingCall().catch(() => {});
+  }, [isNativeApp, call.incomingCall]);
 
   function personLabel(v) {
     if (!v) return 'N/A';
@@ -973,4 +1047,17 @@ function DoctorFeeRow({ doctor, onSave }) {
     </div>
   );
 }
-ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+
+try {
+  const rootEl = document.getElementById('root');
+  if (rootEl && rootEl.childNodes.length === 0) {
+    rootEl.textContent = 'Loading…';
+  }
+  ReactDOM.createRoot(rootEl).render(
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
+  );
+} catch (e) {
+  showStartupOverlay('Fatal startup exception', e?.stack || String(e));
+}
